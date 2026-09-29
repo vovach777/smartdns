@@ -1,5 +1,20 @@
 # smartdns — локальный умный резолвер
 
+> Локальный DNS-резолвер на Go с цепочками апстримов и отбраковкой мусорных ответов (богон-сети, пустой `A`, `SERVFAIL`/`REFUSED`).
+
+## Быстрый старт
+
+Требуется **Go ≥ 1.25**.
+
+```bash
+git clone https://github.com/vovach777/smartdns.git
+cd smartdns
+go build -o smartdns .        # либо: ./build.sh
+sudo ./smartdns -config smartdns.yaml
+```
+
+Проверить конфиг без запуска: `./smartdns -check`. Подробности конфигурации и архитектуры — ниже.
+
 Локальный DNS-сервер, который решает одну задачу:
 
 > У меня есть «умный» резолвер (например `111.88.96.50` / `https://xbox-dns.ru/dns-query`),  
