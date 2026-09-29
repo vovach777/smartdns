@@ -1,0 +1,12 @@
+# собранные бинарники (регенерируются через go build / build.sh)
+/smartdns
+/smartdns.exe
+/smartdns-linux-amd64
+/smartdns-darwin-amd64
+/smartdns-darwin-arm64
+/smartdns-windows-amd64.exe
+
+# тесты / логи
+*.test
+*.out
+/var/log/smartdns.log
