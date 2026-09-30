@@ -41,7 +41,7 @@ func NewApp(cfg *Config) (*App, error) {
 func (a *App) apply(cfg *Config) error {
 	ups := make(map[string]*upstream, len(cfg.Servers))
 	for name, spec := range cfg.Servers {
-		u, err := newUpstream(name, spec, cfg.timeoutDur, cfg.BindDevices[name])
+		u, err := newUpstream(name, spec, cfg.timeoutDur, cfg.BindDevices[name], cfg.Bootstrap)
 		if err != nil {
 			return err
 		}

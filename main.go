@@ -244,6 +244,11 @@ func describe(cfg *Config, path string) {
 	} else {
 		fmt.Printf("прогрев:     выключен (канал поднимается на каждом запросе)\n")
 	}
+	if cfg.Bootstrap != "" {
+		fmt.Printf("бутстрап:    %s (имена апстримов — через него, мимо системы)\n", cfg.Bootstrap)
+	} else {
+		fmt.Printf("бутстрап:    не задан (имена апстримов — системным резолвером)\n")
+	}
 	fmt.Printf("отбраковка:  сети %v, пустой A: %v, коды %v\n",
 		cfg.Reject.Networks, cfg.Reject.EmptyA, cfg.Reject.Rcodes)
 	for _, d := range cfg.Dot {

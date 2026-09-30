@@ -17,9 +17,14 @@ import (
 
 // upstream — один DNS-сервер из секции servers.
 // Поддерживаются:
-//   - "1.1.1.1:53" или "1.1.1.1"  — обычный UDP (TCP, если клиент пришёл по TCP)
-//   - "tls://1.1.1.1"             — DoT, порт 853 по умолчанию
+//   - "1.1.1.1:53" или "1.1.1.1"   — обычный UDP (TCP, если клиент пришёл по TCP)
+//   - "tls://9.9.9.9" / "tls://host" — DoT, порт 853 по умолчанию; по IP
+//     сертификат проверяется против IP SAN, по имени — против CN
 //   - "https://host/dns-query"     — DoH
+//
+// Апстрим, заданный ИМЕНЕМ, требует резолва — а системным резолвером
+// можем быть мы сами. Поэтому имена ходят через bootstrapResolver,
+// если в конфиге задан bootstrap; IP-литералы резолва не требуют.
 //
 // warmPoolSize — сколько прогретых UDP-сокетов держим на один апстрим.
 // Сокет «привязан» к постоянному 5-tuple, поэтому через прокси или NAT
@@ -50,7 +55,7 @@ type upstream struct {
 	device string // имя интерфейса из bind_devices ("" — не прибит)
 }
 
-func newUpstream(name, spec string, timeout time.Duration, device string) (*upstream, error) {
+func newUpstream(name, spec string, timeout time.Duration, device, bootstrap string) (*upstream, error) {
 	spec = strings.TrimSpace(spec)
 	if timeout <= 0 {
 		timeout = 4 * time.Second
@@ -60,6 +65,9 @@ func newUpstream(name, spec string, timeout time.Duration, device string) (*upst
 		u.device = device
 		u.dialer.Control = bindToDevice(device)
 	}
+	// Имена в адресах апстримов (tls://host, https://host) резолвим
+	// через бутстрап, не через систему: системой можем оказаться мы сами.
+	u.dialer.Resolver = bootstrapResolver(bootstrap, device, timeout)
 	switch {
 	case strings.HasPrefix(spec, "https://"), strings.HasPrefix(spec, "http://"):
 		u.kind, u.addr = "doh", spec

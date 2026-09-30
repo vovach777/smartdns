@@ -147,8 +147,13 @@ type Config struct {
 	WarmServers []string `yaml:"warm_servers"`
 	// Prefetch — тратить холостые запросы прогрева на актуализацию кэша:
 	// переспрашивать записи, которым осталось жить меньше двух интервалов.
-	Prefetch bool              `yaml:"prefetch"`
-	Servers  map[string]string `yaml:"servers"`
+	Prefetch bool `yaml:"prefetch"`
+	// Bootstrap — резолвер для адресов самих апстримов (IP[:порт]).
+	// Нужен, когда апстрим задан именем (tls://dns.quad9.net) и наш
+	// сервер стоит системным: системный резолв — это петля через нас.
+	// Бутстрап ходит к своему серверу напрямую. IP-апстримам не нужен.
+	Bootstrap string            `yaml:"bootstrap"`
+	Servers   map[string]string `yaml:"servers"`
 	Hosts    map[string]string `yaml:"hosts"`
 	Routes   []Route           `yaml:"routes"`
 
@@ -344,6 +349,14 @@ func (c *Config) validate() error {
 		if !bindDeviceSupported {
 			return fmt.Errorf("bind_devices: SO_BINDTODEVICE есть только на Linux")
 		}
+	}
+	if c.Bootstrap != "" {
+		b := normalizeAddr(strings.TrimSpace(c.Bootstrap))
+		host, _, err := net.SplitHostPort(b)
+		if err != nil || net.ParseIP(host) == nil {
+			return fmt.Errorf("bootstrap: %q — нужен IP[:порт], имя резолвить некому", c.Bootstrap)
+		}
+		c.Bootstrap = b
 	}
 	for k, v := range c.Hosts {
 		if err := validateHostValue(v); err != nil {
