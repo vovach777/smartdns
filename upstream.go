@@ -2,11 +2,14 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -53,6 +56,14 @@ type upstream struct {
 	inflight atomic.Int32 // сколько сокетов выдано в работу
 
 	device string // имя интерфейса из bind_devices ("" — не прибит)
+
+	// host — hostname апстрима, если он задан именем ("" — задан IP).
+	// cachedIP — последний резолв host через бутстрап. Диал идёт на
+	// cachedIP сразу, без DNS-запроса; warm-тик его освежает. Пустой —
+	// падаем обратно на диал по имени (резолв inline через Resolver).
+	host     string
+	ipMu     sync.RWMutex
+	cachedIP string
 }
 
 func newUpstream(name, spec string, timeout time.Duration, device, bootstrap string) (*upstream, error) {
@@ -71,13 +82,74 @@ func newUpstream(name, spec string, timeout time.Duration, device, bootstrap str
 	switch {
 	case strings.HasPrefix(spec, "https://"), strings.HasPrefix(spec, "http://"):
 		u.kind, u.addr = "doh", spec
+		if pu, err := url.Parse(spec); err == nil {
+			u.host = hostnameOnly(pu.Hostname())
+		}
 	case strings.HasPrefix(spec, "tls://"):
 		u.kind = "dot"
 		u.addr = normalizeAddrPort(strings.TrimSuffix(strings.TrimPrefix(spec, "tls://"), "/"), "853")
 	default:
 		u.kind, u.addr = "udp", normalizeAddr(spec)
 	}
+	if u.kind != "doh" {
+		h, _, err := net.SplitHostPort(u.addr)
+		if err == nil {
+			u.host = hostnameOnly(h)
+		}
+	}
+	// Имя + бутстрап — резолвим сразу, чтобы первый диал уже шёл на IP.
+	u.refreshHost()
 	return u, nil
+}
+
+// hostnameOnly возвращает имя, если это НЕ IP-литерал; IP → "".
+func hostnameOnly(h string) string {
+	if h == "" || net.ParseIP(h) != nil {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSuffix(h, "."))
+}
+
+// refreshHost переспрашивает у бутстрапа адрес апстрима и обновляет кэш.
+// Ошибку глотаем: диал тогда пойдёт по имени через Resolver — тот же
+// бутстрап, просто без кэша.
+func (u *upstream) refreshHost() {
+	if u.host == "" || u.dialer.Resolver == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), u.timeout)
+	// ip4: AAAA не спрашиваем — smartdns всё равно вырезает IPv6,
+	// второй запрос к бутстрапу каждый тик был бы впустую.
+	ips, err := u.dialer.Resolver.LookupIP(ctx, "ip4", u.host)
+	cancel()
+	if err != nil || len(ips) == 0 {
+		log.Printf("бутстрап: %s не резолвится (%v)", u.host, err)
+		return
+	}
+	u.ipMu.Lock()
+	u.cachedIP = ips[0].String()
+	u.ipMu.Unlock()
+}
+
+// ipOf — последний известный IP host ("" — ещё не резолвили).
+func (u *upstream) ipOf() string {
+	u.ipMu.RLock()
+	defer u.ipMu.RUnlock()
+	return u.cachedIP
+}
+
+// dialAddr — куда реально диалить: cachedIP:port, если host резолвили,
+// иначе исходный addr (резолв случится внутри диалера через бутстрап).
+func (u *upstream) dialAddr(addr string) string {
+	ip := u.ipOf()
+	if u.host == "" || ip == "" {
+		return addr
+	}
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return addr
+	}
+	return net.JoinHostPort(ip, port)
 }
 
 // normalizeAddrPort добавляет порт по умолчанию, если его не указали.
@@ -127,14 +199,14 @@ func (u *upstream) exchange(m *dns.Msg, network string) (*dns.Msg, error) {
 func (u *upstream) plain(m *dns.Msg, network string) (*dns.Msg, error) {
 	c := &dns.Client{Net: network, Timeout: u.timeout, Dialer: u.dialer}
 	if network != "udp" || u.pool == nil {
-		resp, _, err := c.Exchange(m.Copy(), u.addr)
+		resp, _, err := c.Exchange(m.Copy(), u.dialAddr(u.addr))
 		return resp, err
 	}
 
 	conn := u.take()
 	if conn == nil {
 		// пул пуст или занят — не блокируем, работаем одноразовым сокетом
-		resp, _, err := c.Exchange(m.Copy(), u.addr)
+		resp, _, err := c.Exchange(m.Copy(), u.dialAddr(u.addr))
 		go u.refill()
 		return resp, err
 	}
@@ -208,7 +280,7 @@ func (u *upstream) dialUDP() (*dns.Conn, error) {
 	}
 	// Dial по udp создаёт присоединённый сокет: локальный порт фиксирован,
 	// значит 5-tuple не меняется и поток через прокси не пересоздаётся.
-	return c.Dial(u.addr)
+	return c.Dial(u.dialAddr(u.addr))
 }
 
 // enablePool заводит пул прогретых сокетов для обычного UDP-апстрима.
@@ -255,6 +327,7 @@ func (u *upstream) keepalive(tick func()) {
 // прогрев каждого слота: последовательно это были бы четыре цены
 // установления подряд.
 func (u *upstream) warmUp(tick func()) {
+	u.refreshHost() // освежить IP до того, как пойдут диалы
 	if u.kind != "udp" || u.pool == nil {
 		u.keepalive(tick)
 		return
@@ -292,6 +365,7 @@ func (u *upstream) warmLoop(interval time.Duration, tick func(), stop <-chan str
 			return
 		case <-t.C:
 		}
+		u.refreshHost() // греем и бутстрап: запрос держит путь живым + свежий IP
 		if u.kind == "udp" && u.pool != nil {
 			for len(u.pool)+int(u.inflight.Load()) < warmPoolSize {
 				c, err := u.dialUDP()
@@ -340,7 +414,7 @@ func (u *upstream) dot(m *dns.Msg) (*dns.Msg, error) {
 		u.conn = nil
 	}
 
-	conn, err := c.Dial(u.addr)
+	conn, err := c.Dial(u.dialAddr(u.addr))
 	if err != nil {
 		return nil, err
 	}
@@ -368,7 +442,17 @@ func (u *upstream) doh(m *dns.Msg) (*dns.Msg, error) {
 	client := &http.Client{
 		Timeout: u.timeout,
 		Transport: &http.Transport{
-			DialContext: u.dialer.DialContext,
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				// Диалим cachedIP вместо hostname: сертификат при этом
+				// всё равно проверяется по имени из URL (ServerName),
+				// а DNS-запрос на каждый новый коннект не нужен.
+				if host, port, err := net.SplitHostPort(addr); err == nil && u.host != "" && strings.EqualFold(host, u.host) {
+					if ip := u.ipOf(); ip != "" {
+						addr = net.JoinHostPort(ip, port)
+					}
+				}
+				return u.dialer.DialContext(ctx, network, addr)
+			},
 		},
 	}
 	resp, err := client.Do(req)
