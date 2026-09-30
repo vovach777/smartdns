@@ -44,8 +44,10 @@ var (
 	quit      = make(chan struct{})
 	quitOnce  sync.Once
 
-	// dotSels — по одному выборщику сертификатов на каждый dot-слушатель.
+	// dotSels — по одному выборщику сертификатов на каждый dot-слушатель,
+	// dohSels — то же для doh-слушателей.
 	dotSels []*certSelector
+	dohSels []*certSelector
 )
 
 func isWindows() bool { return runtime.GOOS == "windows" }
@@ -250,11 +252,16 @@ func describe(cfg *Config, path string) {
 			fmt.Printf("             по SNI %s -> сертификат %s\n", n.ServerName, n.Cert)
 		}
 	}
+	for _, d := range cfg.Doh {
+		fmt.Printf("DoH:         %s/dns-query (сертификат %s)\n", d.Listen, d.Cert)
+	}
 	fmt.Println("\nсерверы:")
 	for _, n := range sortedKeys(cfg.Servers) {
-		u, _ := newUpstream(n, cfg.Servers[n], cfg.timeoutDur)
-		fmt.Printf("  %-12s %s\n", n, cfg.Servers[n])
-		_ = u
+		dev := ""
+		if d := cfg.BindDevices[n]; d != "" {
+			dev = " (dev " + d + ")"
+		}
+		fmt.Printf("  %-12s %s%s\n", n, cfg.Servers[n], dev)
 	}
 	if len(cfg.Hosts) > 0 {
 		fmt.Println("\nhosts:")
@@ -384,6 +391,10 @@ func (g *serverGroup) shutdownLocked() {
 // serve поднимает один сокет. stop закрывается при остановке службы
 // или при смене адреса в конфиге.
 func (a *App) serve(addr, net string, tc *tls.Config, stop <-chan struct{}) {
+	if net == "doh" {
+		a.serveDoH(addr, tc, stop)
+		return
+	}
 	s := &dns.Server{Addr: addr, Net: net, Handler: a.handle(upstreamNet(net))}
 	if net == "tcp-tls" {
 		s.TLSConfig = tc
@@ -417,25 +428,29 @@ func upstreamNet(net string) string {
 // продление подхватывается без перезапуска. На SIGHUP тот же релоадер
 // получает новые пути через update(), и уже поднятые слушатели начинают
 // отдавать новый сертификат — tls.Config ссылается на него.
-func prepareTLS(cfg *Config) ([]*tls.Config, error) {
-	if len(cfg.Dot) == 0 {
+// tlsForListeners готовит по TLS-конфигу на каждый слушатель списка
+// (dot или doh — механика одна: default-сертификат + выбор по SNI).
+// Возвращаемые конфиги идут в том же порядке, в каком listeners()
+// раздаёт их слушателям.
+func tlsForListeners(list dotListeners, sels *[]*certSelector) ([]*tls.Config, error) {
+	if len(list) == 0 {
 		return nil, nil
 	}
-	for len(dotSels) < len(cfg.Dot) {
-		dotSels = append(dotSels, &certSelector{named: map[string]*certReloader{}})
+	for len(*sels) < len(list) {
+		*sels = append(*sels, &certSelector{named: map[string]*certReloader{}})
 	}
-	out := make([]*tls.Config, 0, len(cfg.Dot))
-	for i, d := range cfg.Dot {
-		s := dotSels[i]
+	out := make([]*tls.Config, 0, len(list))
+	for i, d := range list {
+		s := (*sels)[i]
 		if err := upsertReloader(&s.def, d.Cert, d.Key); err != nil {
-			return nil, fmt.Errorf("DoT %s: %w", d.Listen, err)
+			return nil, fmt.Errorf("TLS %s: %w", d.Listen, err)
 		}
 		live := map[string]bool{}
 		for _, n := range d.Named {
 			name := sniKey(n.ServerName)
 			r := s.named[name]
 			if err := upsertReloader(&r, n.Cert, n.Key); err != nil {
-				return nil, fmt.Errorf("DoT %s (%s): %w", d.Listen, n.ServerName, err)
+				return nil, fmt.Errorf("TLS %s (%s): %w", d.Listen, n.ServerName, err)
 			}
 			s.named[name] = r
 			live[name] = true
@@ -448,6 +463,18 @@ func prepareTLS(cfg *Config) ([]*tls.Config, error) {
 		out = append(out, &tls.Config{GetCertificate: s.get, MinVersion: tls.VersionTLS12})
 	}
 	return out, nil
+}
+
+func prepareTLS(cfg *Config) ([]*tls.Config, error) {
+	dotTC, err := tlsForListeners(cfg.Dot, &dotSels)
+	if err != nil {
+		return nil, err
+	}
+	dohTC, err := tlsForListeners(cfg.Doh, &dohSels)
+	if err != nil {
+		return nil, err
+	}
+	return append(dotTC, dohTC...), nil
 }
 
 // upsertReloader заводит релоадер с часовым watch-циклом или обновляет

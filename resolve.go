@@ -41,7 +41,7 @@ func NewApp(cfg *Config) (*App, error) {
 func (a *App) apply(cfg *Config) error {
 	ups := make(map[string]*upstream, len(cfg.Servers))
 	for name, spec := range cfg.Servers {
-		u, err := newUpstream(name, spec, cfg.timeoutDur)
+		u, err := newUpstream(name, spec, cfg.timeoutDur, cfg.BindDevices[name])
 		if err != nil {
 			return err
 		}
@@ -202,8 +202,20 @@ type step struct {
 
 func (a *App) handle(network string) dns.HandlerFunc {
 	return func(w dns.ResponseWriter, r *dns.Msg) {
+		if m := a.resolveQuery(r, network); m != nil {
+			w.WriteMsg(m)
+		}
+	}
+}
+
+// resolveQuery — вся логика одного запроса: hosts, кэш, цепочка с
+// отбраковкой. Возвращает готовый ответ или nil (клиенту не отвечаем).
+// Вызывается и из DNS-слушателей (udp/tcp), и из DoH-обработчика —
+// разница только в транспорте, резолв один и тот же.
+func (a *App) resolveQuery(r *dns.Msg, network string) *dns.Msg {
+	{
 		if len(r.Question) == 0 || r.MsgHdr.Opcode != dns.OpcodeQuery {
-			return
+			return nil
 		}
 		cfg, ups, cache := a.snapshot()
 
@@ -214,11 +226,10 @@ func (a *App) handle(network string) dns.HandlerFunc {
 		// 1. Статические подмены из секции hosts.
 		if v, ok := cfg.hostValue(name); ok {
 			m := hostAnswer(r, q, v)
-			w.WriteMsg(m)
 			if cfg.Verbose {
 				log.Printf("ХОСТ    %-5s %-34s -> %s", dns.TypeToString[q.Qtype], name, v)
 			}
-			return
+			return m
 		}
 
 		// 2. IPv6 вырезан: на AAAA отвечаем пустым NOERROR, без записей.
@@ -227,22 +238,20 @@ func (a *App) handle(network string) dns.HandlerFunc {
 			m := new(dns.Msg)
 			m.SetReply(r)
 			m.RecursionAvailable = true
-			w.WriteMsg(m)
 			if cfg.Verbose {
 				log.Printf("БЛОК    AAAA  %-34s -> пустой NOERROR (IPv6 вырезан)", name)
 			}
-			return
+			return m
 		}
 
 		// 3. Кэш.
 		if cfg.Cache.Enabled && cache != nil {
 			if hit := cache.Get(key); hit != nil {
 				hit.Id = r.Id
-				w.WriteMsg(hit)
 				if cfg.Verbose {
 					log.Printf("КЭШ     %-5s %-34s", dns.TypeToString[q.Qtype], name)
 				}
-				return
+				return hit
 			}
 		}
 
@@ -285,10 +294,9 @@ func (a *App) handle(network string) dns.HandlerFunc {
 			m.SetReply(r)
 			m.RecursionAvailable = true
 			m.Rcode = dns.RcodeServerFailure
-			w.WriteMsg(m)
 			log.Printf("СБОЙ    %-5s %-34s никто из цепочки не ответил: %s",
 				dns.TypeToString[q.Qtype], name, traceString(trace))
-			return
+			return m
 		}
 
 		if !cfg.IPv6 {
@@ -298,7 +306,6 @@ func (a *App) handle(network string) dns.HandlerFunc {
 			cache.Put(key, resp)
 		}
 		resp.Id = r.Id
-		w.WriteMsg(resp)
 
 		if cfg.Verbose || usedBad || len(trace) > 1 {
 			ip := answerIP(resp, q.Qtype)
@@ -312,6 +319,7 @@ func (a *App) handle(network string) dns.HandlerFunc {
 			log.Printf("%-8s %-5s %-34s %-18s %s",
 				verdict, dns.TypeToString[q.Qtype], name, ip, traceString(trace))
 		}
+		return resp
 	}
 }
 

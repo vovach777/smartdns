@@ -33,6 +33,10 @@ type upstream struct {
 	addr    string // host:port либо URL
 	timeout time.Duration
 
+	// dialer — все исходящие соединения апстрима. Control прибивает
+	// сокет к интерфейсу, если задан bind_devices (SO_BINDTODEVICE).
+	dialer *net.Dialer
+
 	// постоянное DoT-соединение. Заведено отдельно, потому что поднимать
 	// TCP+TLS на каждый запрос слишком дорого: через USA-прокси handshake
 	// стоит ~600 мс, а сам запрос по уже открытому соединению — ~120 мс.
@@ -42,22 +46,30 @@ type upstream struct {
 	// пул прогретых UDP-сокетов. nil — работаем как раньше, одноразовыми.
 	pool     chan *dns.Conn
 	inflight atomic.Int32 // сколько сокетов выдано в работу
+
+	device string // имя интерфейса из bind_devices ("" — не прибит)
 }
 
-func newUpstream(name, spec string, timeout time.Duration) (*upstream, error) {
+func newUpstream(name, spec string, timeout time.Duration, device string) (*upstream, error) {
 	spec = strings.TrimSpace(spec)
 	if timeout <= 0 {
 		timeout = 4 * time.Second
 	}
+	u := &upstream{name: name, timeout: timeout, dialer: &net.Dialer{Timeout: timeout}}
+	if device != "" {
+		u.device = device
+		u.dialer.Control = bindToDevice(device)
+	}
 	switch {
 	case strings.HasPrefix(spec, "https://"), strings.HasPrefix(spec, "http://"):
-		return &upstream{name: name, kind: "doh", addr: spec, timeout: timeout}, nil
+		u.kind, u.addr = "doh", spec
 	case strings.HasPrefix(spec, "tls://"):
-		hostport := strings.TrimSuffix(strings.TrimPrefix(spec, "tls://"), "/")
-		return &upstream{name: name, kind: "dot", addr: normalizeAddrPort(hostport, "853"), timeout: timeout}, nil
+		u.kind = "dot"
+		u.addr = normalizeAddrPort(strings.TrimSuffix(strings.TrimPrefix(spec, "tls://"), "/"), "853")
 	default:
-		return &upstream{name: name, kind: "udp", addr: normalizeAddr(spec), timeout: timeout}, nil
+		u.kind, u.addr = "udp", normalizeAddr(spec)
 	}
+	return u, nil
 }
 
 // normalizeAddrPort добавляет порт по умолчанию, если его не указали.
@@ -80,10 +92,16 @@ func normalizeAddrPort(spec, defPort string) string {
 }
 
 func (u *upstream) String() string {
+	var s string
 	if u.kind == "doh" {
-		return u.name + " (" + u.addr + ")"
+		s = u.name + " (" + u.addr + ")"
+	} else {
+		s = u.name + " (" + u.addr + "/" + u.kind + ")"
 	}
-	return u.name + " (" + u.addr + "/" + u.kind + ")"
+	if u.device != "" {
+		s += " dev " + u.device
+	}
+	return s
 }
 
 func (u *upstream) exchange(m *dns.Msg, network string) (*dns.Msg, error) {
@@ -99,7 +117,7 @@ func (u *upstream) exchange(m *dns.Msg, network string) (*dns.Msg, error) {
 // plain — обычный DNS тем же транспортом, каким пришёл клиент
 // (с TCP-клиента стучимся по TCP).
 func (u *upstream) plain(m *dns.Msg, network string) (*dns.Msg, error) {
-	c := &dns.Client{Net: network, Timeout: u.timeout}
+	c := &dns.Client{Net: network, Timeout: u.timeout, Dialer: u.dialer}
 	if network != "udp" || u.pool == nil {
 		resp, _, err := c.Exchange(m.Copy(), u.addr)
 		return resp, err
@@ -178,7 +196,7 @@ func (u *upstream) dialUDP() (*dns.Conn, error) {
 	c := &dns.Client{
 		Net:     "udp",
 		Timeout: u.timeout,
-		Dialer:  &net.Dialer{Timeout: u.timeout},
+		Dialer:  u.dialer,
 	}
 	// Dial по udp создаёт присоединённый сокет: локальный порт фиксирован,
 	// значит 5-tuple не меняется и поток через прокси не пересоздаётся.
@@ -302,6 +320,7 @@ func (u *upstream) dot(m *dns.Msg) (*dns.Msg, error) {
 		Net:       "tcp-tls",
 		Timeout:   u.timeout,
 		TLSConfig: &tls.Config{ServerName: host},
+		Dialer:    u.dialer,
 	}
 
 	if u.conn != nil {
@@ -338,7 +357,12 @@ func (u *upstream) doh(m *dns.Msg) (*dns.Msg, error) {
 	}
 	req.Header.Set("Content-Type", "application/dns-message")
 	req.Header.Set("Accept", "application/dns-message")
-	client := &http.Client{Timeout: u.timeout}
+	client := &http.Client{
+		Timeout: u.timeout,
+		Transport: &http.Transport{
+			DialContext: u.dialer.DialContext,
+		},
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err

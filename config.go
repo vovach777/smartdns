@@ -133,6 +133,9 @@ type Config struct {
 	Reject  RejectConfig `yaml:"reject"`
 	Cache   CacheConfig  `yaml:"cache"`
 	Dot     dotListeners `yaml:"dot"`
+	// Doh — слушатели DNS-over-HTTPS (RFC 8484). Тот же формат, что у dot:
+	// listen + cert + key. Путь фиксированный — /dns-query.
+	Doh     dotListeners `yaml:"doh"`
 	// Warm — как часто прогревать каналы до апстримов ("5s", "30s").
 	// Пусто или 0 — не прогревать: каждый запрос сам открывает соединение.
 	// WarmName — чем прогревать (любое заведомо резолвящееся имя).
@@ -148,6 +151,12 @@ type Config struct {
 	Servers  map[string]string `yaml:"servers"`
 	Hosts    map[string]string `yaml:"hosts"`
 	Routes   []Route           `yaml:"routes"`
+
+	// BindDevices — имя апстрима -> сетевой интерфейс (SO_BINDTODEVICE).
+	// Апстрим тогда выходит через указанный интерфейс независимо от
+	// policy-routing'а: правильный примитив для привязки апстрима к
+	// туннелю вместо гвоздей вида "ip rule to 1.1.1.1".
+	BindDevices map[string]string `yaml:"bind_devices"`
 
 	// вычисляемое
 	timeoutDur   time.Duration
@@ -325,6 +334,17 @@ func (c *Config) validate() error {
 			}
 		}
 	}
+	for s, dev := range c.BindDevices {
+		if !known[s] {
+			return fmt.Errorf("bind_devices: неизвестный сервер %q; известные: %v", s, names)
+		}
+		if dev == "" || strings.ContainsAny(dev, " \t\"'") {
+			return fmt.Errorf("bind_devices: странное имя интерфейса %q у сервера %q", dev, s)
+		}
+		if !bindDeviceSupported {
+			return fmt.Errorf("bind_devices: SO_BINDTODEVICE есть только на Linux")
+		}
+	}
 	for k, v := range c.Hosts {
 		if err := validateHostValue(v); err != nil {
 			return fmt.Errorf("hosts: %q — %v", k, err)
@@ -357,6 +377,19 @@ func (c *Config) validate() error {
 			ns[key] = true
 		}
 	}
+	seenDoh := map[string]bool{}
+	for _, d := range c.Doh {
+		if d.Listen == "" {
+			return fmt.Errorf("doh.listen не задан")
+		}
+		if d.Cert == "" || d.Key == "" {
+			return fmt.Errorf("doh %s: нужны оба — cert и key", d.Listen)
+		}
+		if seenDoh[d.Listen] {
+			return fmt.Errorf("doh: адрес %s повторяется", d.Listen)
+		}
+		seenDoh[d.Listen] = true
+	}
 	return nil
 }
 
@@ -383,6 +416,17 @@ func (c *Config) listeners(tlsConfs []*tls.Config) []listener {
 			tc = tlsConfs[i]
 		}
 		ls = append(ls, listener{addr: d.Listen, net: "tcp-tls", tls: tc})
+	}
+	// TLS-конфиги DoH-слушателей идут в tlsConfs следом за DoT.
+	for i, d := range c.Doh {
+		if d.Listen == "" {
+			continue
+		}
+		var tc *tls.Config
+		if j := len(c.Dot) + i; j < len(tlsConfs) {
+			tc = tlsConfs[j]
+		}
+		ls = append(ls, listener{addr: d.Listen, net: "doh", tls: tc})
 	}
 	return ls
 }
