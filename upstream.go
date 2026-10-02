@@ -70,9 +70,13 @@ type upstream struct {
 	host     string
 	ipMu     sync.RWMutex
 	cachedIP string
+
+	// pin — адрес из bootstrap, прибитый к имени апстрима ("" — нет).
+	// Резолву он не подлежит: спрашивать некого и не надо.
+	pin string
 }
 
-func newUpstream(name, spec string, timeout time.Duration, device, bootstrap string) (*upstream, error) {
+func newUpstream(name, spec string, timeout time.Duration, device string, b boot) (*upstream, error) {
 	spec = strings.TrimSpace(spec)
 	if timeout <= 0 {
 		timeout = 4 * time.Second
@@ -84,28 +88,41 @@ func newUpstream(name, spec string, timeout time.Duration, device, bootstrap str
 	}
 	// Имена в адресах апстримов (tls://host, https://host) резолвим
 	// через бутстрап, не через систему: системой можем оказаться мы сами.
-	u.dialer.Resolver = bootstrapResolver(bootstrap, device, timeout)
+	u.dialer.Resolver = bootstrapResolver(b.resolver, device, timeout)
 	switch {
 	case strings.HasPrefix(spec, "https://"), strings.HasPrefix(spec, "http://"):
 		u.kind, u.addr = "doh", spec
-		if pu, err := url.Parse(spec); err == nil {
-			u.host = hostnameOnly(pu.Hostname())
-		}
 	case strings.HasPrefix(spec, "tls://"):
 		u.kind = "dot"
 		u.addr = normalizeAddrPort(strings.TrimSuffix(strings.TrimPrefix(spec, "tls://"), "/"), "853")
 	default:
 		u.kind, u.addr = "udp", normalizeAddr(spec)
 	}
-	if u.kind != "doh" {
-		h, _, err := net.SplitHostPort(u.addr)
-		if err == nil {
-			u.host = hostnameOnly(h)
-		}
-	}
+	u.host = specHost(spec)
+	u.pin = b.pinFor(u.host)
 	// Имя + бутстрап — резолвим сразу, чтобы первый диал уже шёл на IP.
 	u.refreshHost()
 	return u, nil
+}
+
+// specHost — имя апстрима из его адреса ("" — задан IP-литералом).
+func specHost(spec string) string {
+	spec = strings.TrimSpace(spec)
+	switch {
+	case strings.HasPrefix(spec, "https://"), strings.HasPrefix(spec, "http://"):
+		if pu, err := url.Parse(spec); err == nil {
+			return hostnameOnly(pu.Hostname())
+		}
+	case strings.HasPrefix(spec, "tls://"):
+		if h, _, err := net.SplitHostPort(normalizeAddrPort(strings.TrimSuffix(strings.TrimPrefix(spec, "tls://"), "/"), "853")); err == nil {
+			return hostnameOnly(h)
+		}
+	default:
+		if h, _, err := net.SplitHostPort(normalizeAddr(spec)); err == nil {
+			return hostnameOnly(h)
+		}
+	}
+	return ""
 }
 
 // hostnameOnly возвращает имя, если это НЕ IP-литерал; IP → "".
@@ -120,7 +137,8 @@ func hostnameOnly(h string) string {
 // Ошибку глотаем: диал тогда пойдёт по имени через Resolver — тот же
 // бутстрап, просто без кэша.
 func (u *upstream) refreshHost() {
-	if u.host == "" || u.dialer.Resolver == nil {
+	// Прибитый адрес переспрашивать незачем: он и есть ответ.
+	if u.host == "" || u.pin != "" || u.dialer.Resolver == nil {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), u.timeout)
@@ -144,15 +162,19 @@ func (u *upstream) ipOf() string {
 	return u.cachedIP
 }
 
-// dialAddr — куда реально диалить: cachedIP:port, если host резолвили,
-// иначе исходный addr (резолв случится внутри диалера через бутстрап).
+// dialAddr — куда реально диалить: прибитый адрес, иначе cachedIP:port,
+// если host резолвили, иначе исходный addr (резолв случится внутри
+// диалера через бутстрап).
 func (u *upstream) dialAddr(addr string) string {
-	ip := u.ipOf()
-	if u.host == "" || ip == "" {
-		return addr
-	}
 	_, port, err := net.SplitHostPort(addr)
 	if err != nil {
+		port = ""
+	}
+	if u.pin != "" {
+		return pinAddr(u.pin, port)
+	}
+	ip := u.ipOf()
+	if u.host == "" || ip == "" || port == "" {
 		return addr
 	}
 	return net.JoinHostPort(ip, port)
@@ -447,16 +469,14 @@ func (u *upstream) httpClient() *http.Client {
 		Timeout: u.timeout,
 		Transport: &http.Transport{
 			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-				// Диалим cachedIP вместо hostname: сертификат при этом
-				// всё равно проверяется по имени из URL (ServerName),
-				// а DNS-запрос на каждый новый коннект не нужен.
-				// IP подставляется на каждом диал, а не один раз при
-				// создании клиента — так смена адреса апстрима
+				// Диалим прибитый или закэшированный IP вместо hostname:
+				// сертификат при этом всё равно проверяется по имени из
+				// URL (ServerName), а DNS-запрос на каждый новый коннект
+				// не нужен. IP подставляется на каждом диал, а не один
+				// раз при создании клиента — так смена адреса апстрима
 				// подхватывается без пересоздания клиента.
-				if host, port, err := net.SplitHostPort(addr); err == nil && u.host != "" && strings.EqualFold(host, u.host) {
-					if ip := u.ipOf(); ip != "" {
-						addr = net.JoinHostPort(ip, port)
-					}
+				if host, _, err := net.SplitHostPort(addr); err == nil && u.host != "" && strings.EqualFold(host, u.host) {
+					addr = u.dialAddr(addr)
 				}
 				return u.dialer.DialContext(ctx, network, addr)
 			},

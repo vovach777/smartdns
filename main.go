@@ -22,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -244,10 +245,22 @@ func describe(cfg *Config, path string) {
 	} else {
 		fmt.Printf("прогрев:     выключен (канал поднимается на каждом запросе)\n")
 	}
-	if cfg.Bootstrap != "" {
-		fmt.Printf("бутстрап:    %s (имена апстримов — через него, мимо системы)\n", cfg.Bootstrap)
+	if cfg.boot.resolver != "" {
+		fmt.Printf("бутстрап:    %s (имена апстримов — через него, мимо системы)\n", cfg.boot.resolver)
+	} else if len(cfg.boot.pins) > 0 {
+		fmt.Printf("бутстрап:    адреса прибиты, резолвер не нужен\n")
 	} else {
 		fmt.Printf("бутстрап:    не задан (имена апстримов — системным резолвером)\n")
+	}
+	if len(cfg.boot.pins) > 0 {
+		names := make([]string, 0, len(cfg.boot.pins))
+		for k := range cfg.boot.pins {
+			names = append(names, k)
+		}
+		sort.Strings(names)
+		for _, k := range names {
+			fmt.Printf("             %s -> %s\n", k, cfg.boot.pins[k])
+		}
 	}
 	fmt.Printf("отбраковка:  сети %v, пустой A: %v, коды %v\n",
 		cfg.Reject.Networks, cfg.Reject.EmptyA, cfg.Reject.Rcodes)

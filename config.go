@@ -149,14 +149,20 @@ type Config struct {
 	// Prefetch — тратить холостые запросы прогрева на актуализацию кэша:
 	// переспрашивать записи, которым осталось жить меньше двух интервалов.
 	Prefetch bool `yaml:"prefetch"`
-	// Bootstrap — резолвер для адресов самих апстримов (IP[:порт]).
-	// Нужен, когда апстрим задан именем (tls://dns.quad9.net) и наш
-	// сервер стоит системным: системный резолв — это петля через нас.
-	// Бутстрап ходит к своему серверу напрямую. IP-апстримам не нужен.
-	Bootstrap string            `yaml:"bootstrap"`
-	Servers   map[string]string `yaml:"servers"`
-	Hosts     map[string]string `yaml:"hosts"`
-	Routes    []Route           `yaml:"routes"`
+	// Bootstrap — откуда брать адреса апстримов, заданных именем.
+	// Два вида на один ключ:
+	//   bootstrap: 1.1.1.1                  — один резолвер на все имена
+	//   bootstrap: {dns.quad9.net: 9.9.9.9} — имя прибито к адресу гвоздём
+	// Зачем: когда наш сервер стоит системным (клиенты на 127.0.0.1:53),
+	// «резолвить через систему» значит спросить самих себя. Апстримам,
+	// заданным IP-литералом, бутстрап не нужен вовсе.
+	Bootstrap BootstrapSpec `yaml:"bootstrap"`
+	// BootstrapDNS — резолвер для имён без привязки. Нужен в паре с
+	// картой: bootstrap в виде карты места для резолвера не оставляет.
+	BootstrapDNS string            `yaml:"bootstrap_dns"`
+	Servers      map[string]string `yaml:"servers"`
+	Hosts        map[string]string `yaml:"hosts"`
+	Routes       []Route           `yaml:"routes"`
 
 	// BindDevices — имя апстрима -> сетевой интерфейс (SO_BINDTODEVICE).
 	// Апстрим тогда выходит через указанный интерфейс независимо от
@@ -170,6 +176,39 @@ type Config struct {
 	warmServers  map[string]bool
 	rejectNets   []net.IPNet
 	rejectRcodes map[int]bool
+	boot         boot // бутстрап: резолвер + прибитые адреса
+}
+
+// BootstrapSpec — значение ключа bootstrap: либо адрес резолвера, либо
+// карта «имя апстрима -> адрес». Один ключ на два вида, потому что оба
+// отвечают на один вопрос («откуда взять IP апстрима»), а в конфиге рядом
+// им всё равно не место: прибитый адрес резолва не требует вовсе.
+//
+// Резолвер для имён без привязки в карте задать негде — для него есть
+// отдельный ключ bootstrap_dns.
+type BootstrapSpec struct {
+	Addr string            // скалярная форма: адрес резолвера
+	Pins map[string]string // карта: имя -> IP[:порт]
+}
+
+func (b *BootstrapSpec) UnmarshalYAML(n *yaml.Node) error {
+	switch n.Kind {
+	case yaml.ScalarNode:
+		var s string
+		if err := n.Decode(&s); err != nil {
+			return err
+		}
+		b.Addr, b.Pins = strings.TrimSpace(s), nil
+	case yaml.MappingNode:
+		m := map[string]string{}
+		if err := n.Decode(&m); err != nil {
+			return err
+		}
+		b.Addr, b.Pins = "", m
+	case yaml.SequenceNode:
+		return fmt.Errorf("bootstrap: ожидается адрес или карта «имя: адрес», а не список")
+	}
+	return nil
 }
 
 func defaultConfig() Config {
@@ -206,7 +245,7 @@ func defaultConfig() Config {
 var knownTopKeys = []string{
 	"listen", "ipv6", "timeout", "log", "verbose", "reject", "cache",
 	"dot", "doh", "warm", "warm_name", "warm_servers", "prefetch",
-	"bootstrap", "servers", "hosts", "routes", "bind_devices",
+	"bootstrap", "bootstrap_dns", "servers", "hosts", "routes", "bind_devices",
 }
 
 func warnUnknownKeys(data []byte) {
@@ -388,13 +427,50 @@ func (c *Config) validate() error {
 			return fmt.Errorf("bind_devices: SO_BINDTODEVICE есть только на Linux")
 		}
 	}
-	if c.Bootstrap != "" {
-		b := normalizeAddr(strings.TrimSpace(c.Bootstrap))
+	if c.Bootstrap.Addr != "" && strings.TrimSpace(c.BootstrapDNS) != "" {
+		return fmt.Errorf("bootstrap задан адресом и строки, и bootstrap_dns — оставьте что-то одно")
+	}
+	resolver := c.Bootstrap.Addr
+	if resolver == "" {
+		resolver = strings.TrimSpace(c.BootstrapDNS)
+	}
+	if resolver != "" {
+		b := normalizeAddr(resolver)
 		host, _, err := net.SplitHostPort(b)
 		if err != nil || net.ParseIP(host) == nil {
-			return fmt.Errorf("bootstrap: %q — нужен IP[:порт], имя резолвить некому", c.Bootstrap)
+			return fmt.Errorf("bootstrap: %q — нужен IP[:порт], имя резолвить некому", resolver)
 		}
-		c.Bootstrap = b
+		c.boot.resolver = b
+	}
+	if len(c.Bootstrap.Pins) > 0 {
+		// Имя в привязке должно встречаться среди апстримов: опечатка
+		// здесь молча означает «настройка ни к чему не применена».
+		hosts := map[string]bool{}
+		for _, spec := range c.Servers {
+			if h := specHost(spec); h != "" {
+				hosts[h] = true
+			}
+		}
+		c.boot.pins = make(map[string]string, len(c.Bootstrap.Pins))
+		keys := make([]string, 0, len(c.Bootstrap.Pins))
+		for k := range c.Bootstrap.Pins {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			host := bootKey(k)
+			if host == "" {
+				return fmt.Errorf("bootstrap: пустое имя в привязках")
+			}
+			pin, err := normalizePin(c.Bootstrap.Pins[k])
+			if err != nil {
+				return fmt.Errorf("bootstrap: %s — %v", k, err)
+			}
+			if !hosts[host] {
+				log.Printf("bootstrap: имя %q не встречается среди апстримов — привязка ни к чему не применяется", k)
+			}
+			c.boot.pins[host] = pin
+		}
 	}
 	for k, v := range c.Hosts {
 		if err := validateHostValue(v); err != nil {

@@ -2,10 +2,66 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"strings"
 	"time"
 )
+
+// boot — настройки бутстрапа в том виде, в каком их видят апстримы.
+//
+// Два способа задать адрес апстрима, который в конфиге написан именем:
+//
+//	resolver — один резолвер на все имена: спрашиваем его, запоминаем ответ
+//	pins     — имя -> IP, прибито гвоздём: ничего не спрашиваем вообще
+//
+// Они не исключают друг друга: прибитое имя резолвить незачем, остальные
+// имена идут к resolver. Нет ни того, ни другого — работает система.
+type boot struct {
+	resolver string            // IP[:порт]; "" — резолвить системой
+	pins     map[string]string // имя (нижний регистр, без точки) -> IP[:порт]
+}
+
+// pinFor даёт прибитый адрес имени. "" — привязки нет.
+func (b boot) pinFor(host string) string {
+	if len(b.pins) == 0 || host == "" {
+		return ""
+	}
+	return b.pins[bootKey(host)]
+}
+
+// bootKey приводит имя к виду, в котором оно лежит в pins.
+func bootKey(host string) string {
+	return strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
+}
+
+// pinAddr собирает адрес из привязки: если в ней уже есть порт, он важнее
+// порта из адреса апстрима (прибитый IP часто живёт на нестандартном порту).
+func pinAddr(pin, defPort string) string {
+	if _, p, err := net.SplitHostPort(pin); err == nil && p != "" {
+		return pin
+	}
+	if defPort == "" {
+		return pin
+	}
+	return net.JoinHostPort(pin, defPort)
+}
+
+// normalizePin проверяет значение привязки: это должен быть IP или IP:порт.
+// Домен тут бессмыслен — он сам потребовал бы резолва, то есть ровно того,
+// от чего этот ключ и должен избавить.
+func normalizePin(v string) (string, error) {
+	v = strings.TrimSpace(v)
+	if ip := net.ParseIP(v); ip != nil {
+		return ip.String(), nil
+	}
+	if h, p, err := net.SplitHostPort(v); err == nil && p != "" {
+		if ip := net.ParseIP(strings.Trim(h, "[]")); ip != nil {
+			return net.JoinHostPort(ip.String(), p), nil
+		}
+	}
+	return "", fmt.Errorf("нужен IP или IP:порт, а не %q", v)
+}
 
 // bootstrap — резолвер только для адресов самих апстримов.
 //
