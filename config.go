@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/tls"
 	"fmt"
+	"log"
 	"net"
 	"os"
 	"sort"
@@ -135,7 +136,7 @@ type Config struct {
 	Dot     dotListeners `yaml:"dot"`
 	// Doh — слушатели DNS-over-HTTPS (RFC 8484). Тот же формат, что у dot:
 	// listen + cert + key. Путь фиксированный — /dns-query.
-	Doh     dotListeners `yaml:"doh"`
+	Doh dotListeners `yaml:"doh"`
 	// Warm — как часто прогревать каналы до апстримов ("5s", "30s").
 	// Пусто или 0 — не прогревать: каждый запрос сам открывает соединение.
 	// WarmName — чем прогревать (любое заведомо резолвящееся имя).
@@ -154,8 +155,8 @@ type Config struct {
 	// Бутстрап ходит к своему серверу напрямую. IP-апстримам не нужен.
 	Bootstrap string            `yaml:"bootstrap"`
 	Servers   map[string]string `yaml:"servers"`
-	Hosts    map[string]string `yaml:"hosts"`
-	Routes   []Route           `yaml:"routes"`
+	Hosts     map[string]string `yaml:"hosts"`
+	Routes    []Route           `yaml:"routes"`
 
 	// BindDevices — имя апстрима -> сетевой интерфейс (SO_BINDTODEVICE).
 	// Апстрим тогда выходит через указанный интерфейс независимо от
@@ -194,6 +195,42 @@ func defaultConfig() Config {
 	}
 }
 
+// knownTopKeys — ключи верхнего уровня, которые конфиг понимает.
+//
+// YAML разбирается нестрого (yaml.Unmarshal, без KnownFields), поэтому
+// опечатка в названии ключа иначе проглатывается молча: конфиг читается,
+// настройка не применяется, а почему сервер ведёт себя иначе — не видно.
+// Строгим разбор делать не стали: он ломает уже работающие конфиги с
+// лишними ключами. Предупреждение в лог даёт понять причину и не ломает
+// ничего.
+var knownTopKeys = []string{
+	"listen", "ipv6", "timeout", "log", "verbose", "reject", "cache",
+	"dot", "doh", "warm", "warm_name", "warm_servers", "prefetch",
+	"bootstrap", "servers", "hosts", "routes", "bind_devices",
+}
+
+func warnUnknownKeys(data []byte) {
+	var node yaml.Node
+	if err := yaml.Unmarshal(data, &node); err != nil || len(node.Content) == 0 {
+		return
+	}
+	root := node.Content[0]
+	if root.Kind != yaml.MappingNode {
+		return
+	}
+	known := make(map[string]bool, len(knownTopKeys))
+	for _, k := range knownTopKeys {
+		known[k] = true
+	}
+	for i := 0; i+1 < len(root.Content); i += 2 {
+		k := strings.ToLower(strings.TrimSpace(root.Content[i].Value))
+		if k == "" || known[k] {
+			continue
+		}
+		log.Printf("конфиг: неизвестный ключ %q — игнорирую", root.Content[i].Value)
+	}
+}
+
 // LoadConfig читает YAML поверх значений по умолчанию: чего в файле нет,
 // то остаётся дефолтным.
 func LoadConfig(path string) (*Config, error) {
@@ -207,6 +244,7 @@ func LoadConfig(path string) (*Config, error) {
 		if err := yaml.Unmarshal(data, &cfg); err != nil {
 			return nil, fmt.Errorf("разбор %s: %w", path, err)
 		}
+		warnUnknownKeys(data)
 	}
 
 	if len(cfg.Listen) == 0 {

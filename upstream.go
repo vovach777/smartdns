@@ -57,6 +57,12 @@ type upstream struct {
 
 	device string // имя интерфейса из bind_devices ("" — не прибит)
 
+	// hc — постоянный HTTP-клиент для DoH. Заведён один на апстрим, чтобы
+	// соединение жило между запросами: транспорт с пулом переиспользует
+	// уже открытый TCP+TLS, а новый клиент на каждый запрос платил бы
+	// полную цену установления потока (на USA-прокси ~600 мс против ~120).
+	hc *http.Client
+
 	// host — hostname апстрима, если он задан именем ("" — задан IP).
 	// cachedIP — последний резолв host через бутстрап. Диал идёт на
 	// cachedIP сразу, без DNS-запроса; warm-тик его освежает. Пустой —
@@ -428,6 +434,44 @@ func (u *upstream) dot(m *dns.Msg) (*dns.Msg, error) {
 	return resp, nil
 }
 
+// httpClient — постоянный клиент для DoH, один на апстрим.
+//
+// Клиент, а не только транспорт: переиспользование соединения держится
+// на пуле внутри Transport, поэтому создавать его на каждый запрос —
+// значит каждый раз платить за TCP+TLS и терять смысл HTTP/2.
+func (u *upstream) httpClient() *http.Client {
+	if u.hc != nil {
+		return u.hc
+	}
+	u.hc = &http.Client{
+		Timeout: u.timeout,
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				// Диалим cachedIP вместо hostname: сертификат при этом
+				// всё равно проверяется по имени из URL (ServerName),
+				// а DNS-запрос на каждый новый коннект не нужен.
+				// IP подставляется на каждом диал, а не один раз при
+				// создании клиента — так смена адреса апстрима
+				// подхватывается без пересоздания клиента.
+				if host, port, err := net.SplitHostPort(addr); err == nil && u.host != "" && strings.EqualFold(host, u.host) {
+					if ip := u.ipOf(); ip != "" {
+						addr = net.JoinHostPort(ip, port)
+					}
+				}
+				return u.dialer.DialContext(ctx, network, addr)
+			},
+			// Прогретые соединения держат канал открытым: через прокси
+			// установление потока дороже самого запроса.
+			MaxIdleConns:        8,
+			MaxIdleConnsPerHost: 2,
+			IdleConnTimeout:     90 * time.Second,
+			TLSHandshakeTimeout: u.timeout,
+			ForceAttemptHTTP2:   true,
+		},
+	}
+	return u.hc
+}
+
 func (u *upstream) doh(m *dns.Msg) (*dns.Msg, error) {
 	packed, err := m.Copy().Pack()
 	if err != nil {
@@ -439,23 +483,7 @@ func (u *upstream) doh(m *dns.Msg) (*dns.Msg, error) {
 	}
 	req.Header.Set("Content-Type", "application/dns-message")
 	req.Header.Set("Accept", "application/dns-message")
-	client := &http.Client{
-		Timeout: u.timeout,
-		Transport: &http.Transport{
-			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-				// Диалим cachedIP вместо hostname: сертификат при этом
-				// всё равно проверяется по имени из URL (ServerName),
-				// а DNS-запрос на каждый новый коннект не нужен.
-				if host, port, err := net.SplitHostPort(addr); err == nil && u.host != "" && strings.EqualFold(host, u.host) {
-					if ip := u.ipOf(); ip != "" {
-						addr = net.JoinHostPort(ip, port)
-					}
-				}
-				return u.dialer.DialContext(ctx, network, addr)
-			},
-		},
-	}
-	resp, err := client.Do(req)
+	resp, err := u.httpClient().Do(req)
 	if err != nil {
 		return nil, err
 	}
