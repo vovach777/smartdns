@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // ---- минимальный protobuf-энкодер для тестовых .dat ----
@@ -203,6 +204,36 @@ func TestPerNameDat(t *testing.T) {
 	}
 	if _, err := cfg.fetch.buildDomainSet("de", map[string]bool{}, 0); err == nil {
 		t.Error("ждали ошибку про отсутствующую категорию")
+	}
+}
+
+func TestCleanCache(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &Config{GeositeURL: "https://x/{name}.dat", GeoCacheDir: dir}
+	f := newGeoFetcher(cfg)
+
+	old := filepath.Join(dir, "geosite.dat.tmp")
+	fresh := filepath.Join(dir, "geoip.dat.tmp")
+	keep := filepath.Join(dir, "geosite.dat")
+	for _, p := range []string{old, fresh, keep} {
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	past := time.Now().Add(-2 * time.Hour)
+	if err := os.Chtimes(old, past, past); err != nil {
+		t.Fatal(err)
+	}
+	f.cleanCache()
+
+	if _, err := os.Stat(old); !os.IsNotExist(err) {
+		t.Error("старый .tmp не убран")
+	}
+	if _, err := os.Stat(fresh); err != nil {
+		t.Error("свежий .tmp удалён — он может писаться прямо сейчас")
+	}
+	if _, err := os.Stat(keep); err != nil {
+		t.Error("готовый файл удалён")
 	}
 }
 

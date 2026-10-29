@@ -56,16 +56,21 @@ not matter.
 2. **Never blocks DNS.** The transfer runs in a goroutine. Until the set is
    there, the rule simply does not match and the query follows the catch-all
    `"*"`. Subsequent queries see the set.
-3. **Disk cache.** Written atomically (tmp + rename). With a cache present it
-   works offline.
-4. **Timeouts match the file size:** 15 s to connect, up to 10 minutes for the
-   body. 404/403/410 responses are remembered until restart; network failures
-   are not — the next reference retries.
-5. **`include:` is expanded** (per-name mode). v2fly lists are trees of
+3. **Disk cache.** Written atomically (tmp + rename). If the file is already
+   cached it is applied immediately (works offline) and the fresh version is
+   fetched right after. Stale `*.tmp` files older than an hour are removed on
+   first use.
+4. **A set appearing flushes the DNS cache.** Otherwise a domain answered via
+   the catch-all `"*"` while the set was downloading would stay cached for its
+   whole TTL.
+5. **Timeouts match the file size:** 15 s to connect, up to 10 minutes for the
+   body. 404/403/410 responses are remembered until restart; after a network
+   failure retries pause for a minute so queries do not hammer the source.
+6. **`include:` is expanded** (per-name mode). v2fly lists are trees of
    `include:`; attributes (`name @ads`) are stripped — we cannot filter by
    attribute, so the entry is taken whole. The parent set is rebuilt when an
    included set arrives.
-6. **Refresh at 00:00** local time: a single `.dat` is re-downloaded whole and
+7. **Refresh at 00:00** local time: a single `.dat` is re-downloaded whole and
    the referenced categories are re-parsed; in per-name mode only already-loaded
    sets are re-downloaded.
 

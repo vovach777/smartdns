@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"net"
 	"net/http"
@@ -52,8 +53,9 @@ const (
 type geoFetcher struct {
 	cfg      *Config
 	mu       sync.Mutex
-	inflight map[string]bool // "geosite:cn" — чтобы не качать одно и то же дважды
-	failed   map[string]bool // 404 и прочие отказы: не долбить повторно
+	inflight map[string]bool      // "geosite:cn" — чтобы не качать одно и то же дважды
+	failed   map[string]bool      // 404 и прочие отказы: не долбить повторно
+	retryAt  map[string]time.Time // сетевой сбой: пауза перед повтором
 	client   *http.Client
 }
 
@@ -62,6 +64,7 @@ func newGeoFetcher(cfg *Config) *geoFetcher {
 		cfg:      cfg,
 		inflight: map[string]bool{},
 		failed:   map[string]bool{},
+		retryAt:  map[string]time.Time{},
 		client: &http.Client{
 			Timeout: geoDownloadTimeout,
 			Transport: &http.Transport{
@@ -122,6 +125,7 @@ func (f *geoFetcher) ensure(kind, name string) {
 	if f == nil || strings.TrimSpace(f.cfg.GeoCacheDir) == "" {
 		return
 	}
+	f.cleanCache()
 	if f.urlFor(kind, name) == "" {
 		return
 	}
@@ -129,6 +133,10 @@ func (f *geoFetcher) ensure(kind, name string) {
 		key := kind + ":*"
 		f.mu.Lock()
 		if f.failed[key] || f.inflight[key] {
+			f.mu.Unlock()
+			return
+		}
+		if t, ok := f.retryAt[key]; ok && time.Now().Before(t) {
 			f.mu.Unlock()
 			return
 		}
@@ -150,6 +158,8 @@ func (f *geoFetcher) ensure(kind, name string) {
 						f.mu.Lock()
 						f.failed[key] = true
 						f.mu.Unlock()
+					} else {
+						f.backoff(key)
 					}
 					log.Printf("гео: %s.dat — загрузка не удалась: %v", kind, err)
 					return
@@ -166,6 +176,10 @@ func (f *geoFetcher) ensure(kind, name string) {
 		f.mu.Unlock()
 		return
 	}
+	if t, ok := f.retryAt[key]; ok && time.Now().Before(t) {
+		f.mu.Unlock()
+		return
+	}
 	f.inflight[key] = true
 	f.mu.Unlock()
 
@@ -175,13 +189,27 @@ func (f *geoFetcher) ensure(kind, name string) {
 			delete(f.inflight, key)
 			f.mu.Unlock()
 		}()
+		// кэш уже есть — сразу пускаем его в дело: работает и без сети,
+		// а свежую версию подтягиваем следом
+		cached := false
+		if _, err := os.Stat(f.cachePath(kind, name)); err == nil {
+			if err := f.loadFromCache(kind, name); err == nil {
+				cached = true
+				log.Printf("гео: %s:%s взят из кэша", kind, name)
+				f.rebuildLoaded()
+			}
+		}
 		if err := f.download(kind, name); err != nil {
 			if permanentGeoError(err) {
 				f.mu.Lock()
 				f.failed[key] = true
 				f.mu.Unlock()
+			} else {
+				f.backoff(key)
 			}
-			log.Printf("гео: %s:%s — загрузка не удалась: %v", kind, name, err)
+			if !cached {
+				log.Printf("гео: %s:%s — загрузка не удалась: %v", kind, name, err)
+			}
 			return
 		}
 		if err := f.loadFromCache(kind, name); err != nil {
@@ -471,12 +499,23 @@ func (c *Config) setGeosite(name string, set *domainSet) {
 	c.geoMu.Lock()
 	c.geosite[name] = set
 	c.geoMu.Unlock()
+	flushDNSCache()
 }
 
 func (c *Config) setGeoip(name string, set *ipSet) {
 	c.geoMu.Lock()
 	c.geoip[name] = set
 	c.geoMu.Unlock()
+	flushDNSCache()
+}
+
+// flushDNSCache выбрасывает ответы, выданные до появления набора: пока он
+// качался, правило не совпадало и домен успел закэшироваться по общему "*".
+// Без сброса реклама продолжила бы резолвиться ещё TTL записи.
+func flushDNSCache() {
+	if a := app; a != nil {
+		a.FlushCache()
+	}
 }
 
 // loadedSets — какие наборы уже загружены (для полуночного обновления).
@@ -493,6 +532,8 @@ func (c *Config) loadedSets() (site, ip []string) {
 	sort.Strings(ip)
 	return
 }
+
+var geoCleanOnce sync.Once
 
 // geoDatMu сериализует скачивание+разбор единого .dat на весь процесс:
 // наборы общие для всех Config, параллельный разбор 70 МБ бессмыслен.
@@ -713,4 +754,34 @@ func (f *geoFetcher) refreshDat(kind string) {
 	}
 	f.extractWanted(kind, false)
 	log.Printf("гео: %s.dat — обновлён", kind)
+}
+
+// cleanCache убирает недокачанные файлы (*.tmp), оставшиеся после падения или
+// убитого процесса. Свежие не трогаем: их может писать параллельная загрузка.
+// Выполняется один раз за запуск, при первом обращении к кэшу.
+func (f *geoFetcher) cleanCache() {
+	geoCleanOnce.Do(func() {
+		cutoff := time.Now().Add(-time.Hour)
+		filepath.WalkDir(f.cfg.GeoCacheDir, func(path string, d fs.DirEntry, err error) error {
+			if err != nil || d.IsDir() || !strings.HasSuffix(d.Name(), ".tmp") {
+				return nil
+			}
+			if info, statErr := d.Info(); statErr == nil && info.ModTime().Before(cutoff) {
+				if os.Remove(path) == nil {
+					log.Printf("гео: убран недокачанный файл %s", path)
+				}
+			}
+			return nil
+		})
+	})
+}
+
+// geoRetryPause — пауза после сетевого сбоя: без неё каждый запрос к набору
+// заново дёргал бы сеть.
+const geoRetryPause = time.Minute
+
+func (f *geoFetcher) backoff(key string) {
+	f.mu.Lock()
+	f.retryAt[key] = time.Now().Add(geoRetryPause)
+	f.mu.Unlock()
 }
