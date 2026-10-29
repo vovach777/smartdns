@@ -2,6 +2,8 @@ package main
 
 import (
 	"net"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -127,6 +129,80 @@ func TestExtractGeoip(t *testing.T) {
 	}
 	if set.match(net.IP{5, 9, 0, 1}) {
 		t.Error("5.9.0.1 не должен быть в наборе")
+	}
+}
+
+func TestLooksBinary(t *testing.T) {
+	if looksBinary([]byte("domain:example.org\nfull:a.example\n")) {
+		t.Error("текст опознан как бинарь")
+	}
+	if !looksBinary([]byte{0x0a, 0x02, 'r', 'u'}) {
+		t.Error("protobuf не опознан")
+	}
+	if looksBinary(nil) {
+		t.Error("пустой файл — не бинарь")
+	}
+}
+
+// .dat в поштучном режиме ({name}.dat): файл из кэша разбирается как protobuf.
+func TestPerNameDat(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &Config{GeositeURL: "https://x/{name}.dat", GeoipURL: "https://x/{name}.dat", GeoCacheDir: dir}
+	cfg.geosite = map[string]*domainSet{}
+	cfg.geoip = map[string]*ipSet{}
+	cfg.fetch = newGeoFetcher(cfg)
+
+	type d = struct {
+		typ int
+		val string
+	}
+	site := geositeEntry("RU", d{2, "yandex.ru"}, d{3, "mail.yandex.ru"})
+	path := cfg.fetch.cachePath("geosite", "ru")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, site, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	set, err := cfg.fetch.buildDomainSet("ru", map[string]bool{}, 0)
+	if err != nil {
+		t.Fatalf("поштучный .dat: %v", err)
+	}
+	if set == nil || !set.match("yandex.ru") || !set.match("www.yandex.ru") {
+		t.Fatalf("набор не собран: %+v", set)
+	}
+
+	cidr := func(ip []byte, prefix uint64) []byte {
+		var c []byte
+		c = append(c, pbBytes(1, ip)...)
+		c = append(c, pbInt(2, prefix)...)
+		return pbBytes(2, c)
+	}
+	var entry []byte
+	entry = append(entry, pbBytes(1, []byte("RU"))...)
+	entry = append(entry, cidr([]byte{5, 8, 0, 0}, 16)...)
+	ipPath := cfg.fetch.cachePath("geoip", "ru")
+	if err := os.MkdirAll(filepath.Dir(ipPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(ipPath, pbBytes(1, entry), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ipSet, err := cfg.fetch.buildIPSet("ru", map[string]bool{}, 0)
+	if err != nil {
+		t.Fatalf("поштучный geoip .dat: %v", err)
+	}
+	if ipSet == nil || !ipSet.match(net.IP{5, 8, 1, 2}) {
+		t.Fatalf("адресный набор не собран: %+v", ipSet)
+	}
+
+	// файл есть, но категории в нём нет — внятная ошибка, а не пустой набор
+	other := cfg.fetch.cachePath("geosite", "de")
+	if err := os.WriteFile(other, site, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cfg.fetch.buildDomainSet("de", map[string]bool{}, 0); err == nil {
+		t.Error("ждали ошибку про отсутствующую категорию")
 	}
 }
 

@@ -84,6 +84,22 @@ func (f *geoFetcher) urlFor(kind, name string) string {
 	return strings.ReplaceAll(tpl, "{name}", name)
 }
 
+// looksBinary — бинарный ли файл. Текстовые списки (v2fly, ipdeny) — обычный
+// текст; protobuf начинается с ключа поля (0x0a) и байта длины, т.е. сразу
+// содержит управляющие символы.
+func looksBinary(b []byte) bool {
+	n := len(b)
+	if n > 512 {
+		n = 512
+	}
+	for _, c := range b[:n] {
+		if c == 0 || c < 0x09 || (c > 0x0d && c < 0x20) {
+			return true
+		}
+	}
+	return false
+}
+
 // isDatMode — источник задан без {name}, значит это единый .dat-файл.
 func (f *geoFetcher) isDatMode(kind string) bool {
 	tpl := f.cfg.GeositeURL
@@ -248,6 +264,19 @@ func (f *geoFetcher) buildDomainSet(name string, seen map[string]bool, depth int
 		}
 		return &domainSet{Name: name, Full: map[string]bool{}}, nil
 	}
+	// .dat в поштучном режиме ({name}.dat): внутри protobuf одной категории
+	if looksBinary(data) {
+		sets, err := extractGeosite(data, map[string]bool{name: true})
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", path, err)
+		}
+		if set := sets[name]; set != nil {
+			set.Source = path
+			return set, nil
+		}
+		return nil, fmt.Errorf("%s: в файле нет категории %q", path, name)
+	}
+
 	set := &domainSet{Name: name, Source: path, Full: map[string]bool{}}
 	// v2fly дописывает атрибуты: "name @ads", "include:x @attr".
 	// Мы их не фильтруем — берём запись целиком, атрибут отрезаем.
@@ -340,7 +369,22 @@ func (f *geoFetcher) buildIPSet(name string, seen map[string]bool, depth int) (*
 		}
 		return &ipSet{Name: name}, nil
 	}
-	set, err := parseIPSet(path)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	if looksBinary(data) {
+		sets, err := extractGeoip(data, map[string]bool{name: true})
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", path, err)
+		}
+		if set := sets[name]; set != nil {
+			set.Source = path
+			return set, nil
+		}
+		return nil, fmt.Errorf("%s: в файле нет категории %q", path, name)
+	}
+	set, err := parseIPSetData(data, path)
 	if err != nil {
 		return nil, err
 	}

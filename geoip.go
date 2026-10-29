@@ -71,6 +71,13 @@ func parseIPSet(path string) (*ipSet, error) {
 	if err != nil {
 		return nil, fmt.Errorf("geoip: %s: %w", path, err)
 	}
+	return parseIPSetData(data, path)
+}
+
+// parseIPSetData разбирает текстовый набор (по строке на адрес/CIDR).
+// source — только для сообщений об ошибках и поля Source.
+func parseIPSetData(data []byte, source string) (*ipSet, error) {
+	path := source
 	set := &ipSet{Source: path}
 	for i, line := range strings.Split(string(data), "\n") {
 		if h := strings.IndexByte(line, '#'); h >= 0 {

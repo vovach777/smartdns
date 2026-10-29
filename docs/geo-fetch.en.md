@@ -42,6 +42,11 @@ geoip_url:   https://www.ipdeny.com/ipblocks/data/aggregated/{name}-aggregated.z
 `category-ads-all`). Cache: `<geo_cache_dir>/geosite/<name>.txt` and
 `<geo_cache_dir>/geoip/<name>.txt`.
 
+**The format is detected from the file content, not the extension:** control
+bytes in the first bytes mean protobuf (`.dat`), otherwise it is text. So
+`https://…/{name}.dat` (one category per file) works as well; the extension does
+not matter.
+
 ---
 
 ## Behaviour

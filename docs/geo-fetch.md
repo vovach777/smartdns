@@ -41,6 +41,11 @@ geoip_url:   https://www.ipdeny.com/ipblocks/data/aggregated/{name}-aggregated.z
 `category-ads-all`). Кэш: `<geo_cache_dir>/geosite/<name>.txt` и
 `<geo_cache_dir>/geoip/<name>.txt`.
 
+**Формат выбирается по содержимому файла, а не по расширению:** если в первых
+байтах есть управляющие символы — это protobuf (`.dat`), иначе текст. Поэтому
+`https://…/{name}.dat` (одна категория на файл) тоже работает; расширение роли
+не играет.
+
 ---
 
 ## Как это работает
