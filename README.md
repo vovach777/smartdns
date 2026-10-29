@@ -378,6 +378,29 @@ hosts_files: 1 из конфига, 3 из файлов
 **[docs/hosts.md](docs/hosts.md)** (русский) · **[docs/hosts.en.md](docs/hosts.en.md)** (English).
 
 
+### `geosite:` — наборы доменов в маршрутах
+
+Готовые списки (Loyalsoldier, v2fly) текстом, по файлу на категорию:
+
+```yaml
+geosite_dir: /etc/smartdns/geosite
+
+routes:
+  - match: ["geosite:category-ads-all"]
+    chain: [blocked]
+  - match: ["geosite:cn"]
+    chain: [local]
+  - match: ["*"]
+    chain: [upstream]
+```
+
+Формат строк: `domain:name` (имя и поддомены), `full:name` (точное), голое
+`name` (= `domain:`), `#` — комментарий. `regexp:`/`keyword:` не поддерживаются
+и дают ошибку загрузки. Стоимость — **123 нс** на запрос при 300 000 имён.
+
+Подробно, с источником списков, диагностикой и ограничениями:
+**[docs/geosite.md](docs/geosite.md)** (русский) · **[docs/geosite.en.md](docs/geosite.en.md)** (English).
+
 ### `reject`
 
 | Правило    | Суть                                           |

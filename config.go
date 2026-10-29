@@ -167,7 +167,11 @@ type Config struct {
 	// внутри файлов первое вхождение выигрывает. Изменение файла на диске
 	// подхватывается само (опрос раз в 5 с), SIGHUP перечитывает всё сразу.
 	HostsFiles []string `yaml:"hosts_files"`
-	Routes     []Route  `yaml:"routes"`
+	// GeositeDir — каталог текстовых списков доменов, по файлу на набор
+	// (<name>.txt). В routes матчится как "geosite:<name>". Формат строк:
+	// full:name, domain:name, просто name (= domain:), '#' — комментарий.
+	GeositeDir string  `yaml:"geosite_dir"`
+	Routes     []Route `yaml:"routes"`
 
 	// BindDevices — имя апстрима -> сетевой интерфейс (SO_BINDTODEVICE).
 	// Апстрим тогда выходит через указанный интерфейс независимо от
@@ -185,6 +189,8 @@ type Config struct {
 
 	// что прочитано из hosts_files: для логов и -check
 	hostsFiles []hostsFileStat
+	// наборы geosite: имя -> матчер
+	geosite map[string]*domainSet
 }
 
 // BootstrapSpec — значение ключа bootstrap: либо адрес резолвера, либо
@@ -253,7 +259,7 @@ func defaultConfig() Config {
 var knownTopKeys = []string{
 	"listen", "ipv6", "timeout", "log", "verbose", "reject", "cache",
 	"dot", "doh", "warm", "warm_name", "warm_servers", "prefetch",
-	"bootstrap", "bootstrap_dns", "servers", "hosts", "hosts_files", "routes", "bind_devices",
+	"bootstrap", "bootstrap_dns", "servers", "hosts", "hosts_files", "geosite_dir", "routes", "bind_devices",
 }
 
 func warnUnknownKeys(data []byte) {
@@ -355,6 +361,9 @@ func LoadConfig(path string) (*Config, error) {
 	// Файлы hosts подмешиваются до validate: их записи должны пройти ту же
 	// проверку значения, что и явные.
 	if err := cfg.loadHostsFiles(); err != nil {
+		return nil, err
+	}
+	if err := cfg.loadGeosite(); err != nil {
 		return nil, err
 	}
 	if err := cfg.validate(); err != nil {
@@ -609,6 +618,12 @@ func (c *Config) routeFor(name string) []string {
 	for _, r := range c.Routes {
 		for _, m := range r.Match {
 			m = strings.ToLower(strings.TrimSpace(m))
+			if set, ok := strings.CutPrefix(m, "geosite:"); ok {
+				if c.geositeMatch(set, name) {
+					return r.Chain
+				}
+				continue
+			}
 			m = strings.TrimPrefix(m, "*.")
 			if m == "" || m == "*" {
 				continue

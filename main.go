@@ -176,6 +176,13 @@ func run(stop <-chan struct{}) error {
 	watchSignals()
 	go purgeLoop()
 	go watchHostsFiles()
+	go watchGeosite(func() string {
+		cur, _, _ := app.snapshot()
+		if cur == nil {
+			return ""
+		}
+		return cur.GeositeDir
+	})
 
 	if stop == nil {
 		stop = quit
@@ -287,6 +294,13 @@ func describe(cfg *Config, path string) {
 		fmt.Println("\nhosts:")
 		for _, k := range sortedKeys(cfg.Hosts) {
 			fmt.Printf("  %-34s %s\n", k, cfg.Hosts[k])
+		}
+	}
+	if len(cfg.geosite) > 0 {
+		fmt.Printf("\ngeosite: %d наборов из %s\n", len(cfg.geosite), cfg.GeositeDir)
+		for _, n := range geositeNames(cfg.geosite) {
+			set := cfg.geosite[n]
+			fmt.Printf("  %-30s %-46s %d записей\n", n, set.Source, set.Entries)
 		}
 	}
 	if len(cfg.HostsFiles) > 0 {
