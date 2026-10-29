@@ -401,6 +401,23 @@ routes:
 Подробно, с источником списков, диагностикой и ограничениями:
 **[docs/geosite.md](docs/geosite.md)** (русский) · **[docs/geosite.en.md](docs/geosite.en.md)** (English).
 
+### `geoip:` — фильтр ответа по адресам
+
+Маршрут выбирается по имени, а адрес появляется только в ответе — поэтому
+`geoip:` здесь **фильтр готового ответа**, а не правило маршрута:
+
+```yaml
+geoip_dir: /etc/smartdns/geoip
+
+answer_geoip:
+  - set: blocked          # файл geoip/blocked.txt со строками 203.0.113.0/24
+    action: nxdomain      # nxdomain | refused | noerror
+```
+
+Ответ фильтруется один раз и в таком виде попадает в кэш — повторных запросов
+и циклов нет по построению (проверено: второй запрос идёт из кэша).
+Подробно: **[docs/geoip.md](docs/geoip.md)** · **[docs/geoip.en.md](docs/geoip.en.md)**.
+
 ### `reject`
 
 | Правило    | Суть                                           |

@@ -170,8 +170,14 @@ type Config struct {
 	// GeositeDir — каталог текстовых списков доменов, по файлу на набор
 	// (<name>.txt). В routes матчится как "geosite:<name>". Формат строк:
 	// full:name, domain:name, просто name (= domain:), '#' — комментарий.
-	GeositeDir string  `yaml:"geosite_dir"`
-	Routes     []Route `yaml:"routes"`
+	GeositeDir string `yaml:"geosite_dir"`
+	// GeoipDir — каталог адресных наборов (по файлу <name>.txt на набор,
+	// строки — CIDR или отдельные IPv4).
+	GeoipDir string `yaml:"geoip_dir"`
+	// AnswerGeoip — фильтр ГОТОВОГО ответа по адресным наборам: не меняет
+	// маршрут и не делает повторных запросов, только переписывает ответ.
+	AnswerGeoip []AnswerRule `yaml:"answer_geoip"`
+	Routes      []Route      `yaml:"routes"`
 
 	// BindDevices — имя апстрима -> сетевой интерфейс (SO_BINDTODEVICE).
 	// Апстрим тогда выходит через указанный интерфейс независимо от
@@ -191,6 +197,14 @@ type Config struct {
 	hostsFiles []hostsFileStat
 	// наборы geosite: имя -> матчер
 	geosite map[string]*domainSet
+	// наборы geoip: имя -> диапазоны
+	geoip map[string]*ipSet
+}
+
+// AnswerRule — одно правило фильтра ответа по адресному набору.
+type AnswerRule struct {
+	Set    string `yaml:"set"`    // имя набора из geoip_dir
+	Action string `yaml:"action"` // nxdomain | refused | noerror
 }
 
 // BootstrapSpec — значение ключа bootstrap: либо адрес резолвера, либо
@@ -259,7 +273,7 @@ func defaultConfig() Config {
 var knownTopKeys = []string{
 	"listen", "ipv6", "timeout", "log", "verbose", "reject", "cache",
 	"dot", "doh", "warm", "warm_name", "warm_servers", "prefetch",
-	"bootstrap", "bootstrap_dns", "servers", "hosts", "hosts_files", "geosite_dir", "routes", "bind_devices",
+	"bootstrap", "bootstrap_dns", "servers", "hosts", "hosts_files", "geosite_dir", "geoip_dir", "answer_geoip", "routes", "bind_devices",
 }
 
 func warnUnknownKeys(data []byte) {
@@ -364,6 +378,9 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, err
 	}
 	if err := cfg.loadGeosite(); err != nil {
+		return nil, err
+	}
+	if err := cfg.loadGeoip(); err != nil {
 		return nil, err
 	}
 	if err := cfg.validate(); err != nil {

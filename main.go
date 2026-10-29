@@ -176,6 +176,13 @@ func run(stop <-chan struct{}) error {
 	watchSignals()
 	go purgeLoop()
 	go watchHostsFiles()
+	go watchGeoip(func() string {
+		cur, _, _ := app.snapshot()
+		if cur == nil {
+			return ""
+		}
+		return cur.GeoipDir
+	})
 	go watchGeosite(func() string {
 		cur, _, _ := app.snapshot()
 		if cur == nil {
@@ -294,6 +301,20 @@ func describe(cfg *Config, path string) {
 		fmt.Println("\nhosts:")
 		for _, k := range sortedKeys(cfg.Hosts) {
 			fmt.Printf("  %-34s %s\n", k, cfg.Hosts[k])
+		}
+	}
+	if len(cfg.geoip) > 0 {
+		fmt.Printf("\ngeoip: %d наборов из %s\n", len(cfg.geoip), cfg.GeoipDir)
+		for _, n := range geoipNames(cfg.geoip) {
+			set := cfg.geoip[n]
+			extra := ""
+			if set.SkippedV6 > 0 {
+				extra = fmt.Sprintf(", пропущено IPv6: %d", set.SkippedV6)
+			}
+			fmt.Printf("  %-20s %-40s %d префиксов%s\n", n, set.Source, len(set.Ranges), extra)
+		}
+		for _, r := range cfg.AnswerGeoip {
+			fmt.Printf("  фильтр ответа: geoip:%s -> %s\n", r.Set, r.Action)
 		}
 	}
 	if len(cfg.geosite) > 0 {

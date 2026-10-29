@@ -302,6 +302,12 @@ func (a *App) resolveQuery(r *dns.Msg, network string) *dns.Msg {
 		if !cfg.IPv6 {
 			stripIPv6(resp)
 		}
+		// Фильтр ответа по адресным наборам. Только переписывает готовый
+		// ответ — никаких новых запросов, поэтому зациклиться нечему.
+		if cfg.applyAnswerGeoip(resp) && cfg.Verbose {
+			log.Printf("ГЕО     %-5s %-34s -> отфильтровано по answer_geoip",
+				dns.TypeToString[q.Qtype], name)
+		}
 		if cfg.Cache.Enabled && cache != nil && !usedBad {
 			cache.Put(key, resp)
 		}
