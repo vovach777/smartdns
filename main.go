@@ -176,6 +176,13 @@ func run(stop <-chan struct{}) error {
 	watchSignals()
 	go purgeLoop()
 	go watchHostsFiles()
+	go watchMidnight(func() *geoFetcher {
+		cur, _, _ := app.snapshot()
+		if cur == nil {
+			return nil
+		}
+		return cur.fetch
+	})
 	go watchGeoip(func() string {
 		cur, _, _ := app.snapshot()
 		if cur == nil {
@@ -302,6 +309,11 @@ func describe(cfg *Config, path string) {
 		for _, k := range sortedKeys(cfg.Hosts) {
 			fmt.Printf("  %-34s %s\n", k, cfg.Hosts[k])
 		}
+	}
+	if cfg.fetch != nil {
+		fmt.Printf("\nгео-наборы: лениво по URL, кэш %s\n", cfg.GeoCacheDir)
+		fmt.Printf("  домены: %s\n  адреса: %s\n", cfg.GeositeURL, cfg.GeoipURL)
+		fmt.Printf("  обновление: ежедневно в 00:00\n")
 	}
 	if len(cfg.geoip) > 0 {
 		fmt.Printf("\ngeoip: %d наборов из %s\n", len(cfg.geoip), cfg.GeoipDir)

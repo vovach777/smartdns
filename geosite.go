@@ -38,6 +38,8 @@ type domainSet struct {
 	Full     map[string]bool // точные имена (full:)
 	suffixes []string        // отсортированные суффиксы (domain: и голые)
 	Entries  int
+	// SkippedUnsupported — сколько строк regexp:/keyword: пропущено
+	SkippedUnsupported int
 }
 
 // match проверяет имя: сначала точные, потом суффиксы (включая само имя).
@@ -150,8 +152,8 @@ func parseDomainSet(path string) (*domainSet, error) {
 
 // geositeMatch — true, если имя попало в набор `name` (аргумент "geosite:name").
 func (c *Config) geositeMatch(set, host string) bool {
-	s, ok := c.geosite[strings.ToLower(set)]
-	if !ok {
+	s := c.getGeosite(strings.ToLower(set))
+	if s == nil {
 		return false
 	}
 	return s.match(host)

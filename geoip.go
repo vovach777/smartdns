@@ -165,7 +165,7 @@ func (c *Config) applyAnswerGeoip(m *dns.Msg) bool {
 		}
 	}
 	for _, rule := range c.AnswerGeoip {
-		set := c.geoip[strings.ToLower(strings.TrimSpace(rule.Set))]
+		set := c.getGeoip(strings.ToLower(strings.TrimSpace(rule.Set)))
 		if set == nil {
 			continue
 		}

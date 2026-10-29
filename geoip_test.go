@@ -113,3 +113,33 @@ func TestApplyAnswerGeoip(t *testing.T) {
 		t.Fatalf("ответ изменён без причины: rcode=%d answer=%d", m.Rcode, len(m.Answer))
 	}
 }
+
+func TestBuildDomainSetIncludeAndAttrs(t *testing.T) {
+	dir := t.TempDir()
+	os.MkdirAll(filepath.Join(dir, "geosite"), 0o755)
+	write := func(name, body string) {
+		if err := os.WriteFile(filepath.Join(dir, "geosite", name+".txt"), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("root", "include:child @ads\ndomain:root.example\n")
+	write("child", "domain:child.example @cn\nfull:exact.example\nregexp:^re\\.\n")
+
+	cfg := &Config{GeoCacheDir: dir, geosite: map[string]*domainSet{}, geoip: map[string]*ipSet{}}
+	f := newGeoFetcher(cfg)
+	set, err := f.buildDomainSet("root", map[string]bool{}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, h := range []string{"root.example", "a.child.example", "exact.example"} {
+		if !set.match(h) {
+			t.Errorf("ожидалось совпадение %q", h)
+		}
+	}
+	if set.match("nope.dev") {
+		t.Error("ложное совпадение")
+	}
+	if set.SkippedUnsupported != 1 {
+		t.Errorf("SkippedUnsupported = %d, want 1", set.SkippedUnsupported)
+	}
+}

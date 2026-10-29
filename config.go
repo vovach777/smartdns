@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/miekg/dns"
@@ -177,7 +178,14 @@ type Config struct {
 	// AnswerGeoip — фильтр ГОТОВОГО ответа по адресным наборам: не меняет
 	// маршрут и не делает повторных запросов, только переписывает ответ.
 	AnswerGeoip []AnswerRule `yaml:"answer_geoip"`
-	Routes      []Route      `yaml:"routes"`
+	// GeositeURL / GeoipURL — шаблоны URL для ленивой загрузки наборов,
+	// {name} заменяется именем набора. Пустое значение = взять по умолчанию
+	// (v2fly для доменов, ipdeny для адресов).
+	GeositeURL string `yaml:"geosite_url"`
+	GeoipURL   string `yaml:"geoip_url"`
+	// GeoCacheDir — куда складывать скачанные наборы.
+	GeoCacheDir string  `yaml:"geo_cache_dir"`
+	Routes      []Route `yaml:"routes"`
 
 	// BindDevices — имя апстрима -> сетевой интерфейс (SO_BINDTODEVICE).
 	// Апстрим тогда выходит через указанный интерфейс независимо от
@@ -199,6 +207,10 @@ type Config struct {
 	geosite map[string]*domainSet
 	// наборы geoip: имя -> диапазоны
 	geoip map[string]*ipSet
+	// geoMu защищает geosite/geoip: их наполняет фоновая загрузка
+	geoMu sync.RWMutex
+	// fetch — ленивая загрузка наборов по URL
+	fetch *geoFetcher
 }
 
 // AnswerRule — одно правило фильтра ответа по адресному набору.
@@ -273,7 +285,7 @@ func defaultConfig() Config {
 var knownTopKeys = []string{
 	"listen", "ipv6", "timeout", "log", "verbose", "reject", "cache",
 	"dot", "doh", "warm", "warm_name", "warm_servers", "prefetch",
-	"bootstrap", "bootstrap_dns", "servers", "hosts", "hosts_files", "geosite_dir", "geoip_dir", "answer_geoip", "routes", "bind_devices",
+	"bootstrap", "bootstrap_dns", "servers", "hosts", "hosts_files", "geosite_dir", "geoip_dir", "answer_geoip", "geosite_url", "geoip_url", "geo_cache_dir", "routes", "bind_devices",
 }
 
 func warnUnknownKeys(data []byte) {
@@ -383,6 +395,17 @@ func LoadConfig(path string) (*Config, error) {
 	if err := cfg.loadGeoip(); err != nil {
 		return nil, err
 	}
+	if cfg.GeositeURL == "" {
+		cfg.GeositeURL = defaultGeositeURL
+	}
+	if cfg.GeoipURL == "" {
+		cfg.GeoipURL = defaultGeoipURL
+	}
+	if cfg.GeoCacheDir == "" {
+		cfg.GeoCacheDir = defaultGeoCache
+	}
+	cfg.fetch = newGeoFetcher(&cfg)
+	cfg.prefetchReferenced()
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
