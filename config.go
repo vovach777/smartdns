@@ -405,7 +405,6 @@ func LoadConfig(path string) (*Config, error) {
 		cfg.GeoCacheDir = defaultGeoCache
 	}
 	cfg.fetch = newGeoFetcher(&cfg)
-	cfg.prefetchReferenced()
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}

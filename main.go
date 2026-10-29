@@ -131,6 +131,7 @@ func reload() error {
 		log.Printf("перезагрузка конфига не удалась: %v", err)
 		return err
 	}
+	cfg.prefetchReferenced()
 	setupLog(cfg)
 	tc, err := prepareTLS(cfg)
 	if err != nil {
@@ -156,6 +157,9 @@ func run(stop <-chan struct{}) error {
 	if err != nil {
 		return err
 	}
+	// фоновую загрузку гео-наборов запускаем только для живого конфига:
+	// LoadConfig зовётся ещё и для -check, там качать 70 МБ незачем
+	cfg.prefetchReferenced()
 
 	tc, err := prepareTLS(cfg)
 	if err != nil {
@@ -312,7 +316,14 @@ func describe(cfg *Config, path string) {
 	}
 	if cfg.fetch != nil {
 		fmt.Printf("\nгео-наборы: лениво по URL, кэш %s\n", cfg.GeoCacheDir)
-		fmt.Printf("  домены: %s\n  адреса: %s\n", cfg.GeositeURL, cfg.GeoipURL)
+		srcMode := func(u string) string {
+			if u != "" && !strings.Contains(u, "{name}") {
+				return " (единый .dat)"
+			}
+			return ""
+		}
+		fmt.Printf("  домены: %s%s\n  адреса: %s%s\n",
+			cfg.GeositeURL, srcMode(cfg.GeositeURL), cfg.GeoipURL, srcMode(cfg.GeoipURL))
 		fmt.Printf("  обновление: ежедневно в 00:00\n")
 	}
 	if len(cfg.geoip) > 0 {

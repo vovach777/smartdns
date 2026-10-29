@@ -17,9 +17,11 @@ package main
 // оставляет половину списка.
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -31,12 +33,16 @@ import (
 
 const (
 	// источники по умолчанию — те, с которых наборы и брались
-	defaultGeositeURL = "https://raw.githubusercontent.com/v2fly/domain-list-community/master/data/{name}"
-	defaultGeoipURL   = "https://www.ipdeny.com/ipblocks/data/aggregated/{name}-aggregated.zone"
+	// По умолчанию — российские базы v2ray-формата (.dat, всегда последняя
+	// версия в ветке release). Без {name}: файл скачивается целиком, из него
+	// берутся только упомянутые в правилах категории.
+	defaultGeositeURL = "https://raw.githubusercontent.com/runetfreedom/russia-v2ray-rules-dat/release/geosite.dat"
+	defaultGeoipURL   = "https://raw.githubusercontent.com/runetfreedom/russia-v2ray-rules-dat/release/geoip.dat"
 	defaultGeoCache   = "/var/cache/smartdns"
 
-	geoHTTPTimeout = 20 * time.Second
-	geoMaxInclude  = 6 // глубина include:
+	geoDialTimeout     = 15 * time.Second // установка соединения
+	geoDownloadTimeout = 10 * time.Minute // тело: .dat бывает 70 МБ
+	geoMaxInclude      = 6                // глубина include:
 )
 
 type geoFetcher struct {
@@ -52,7 +58,14 @@ func newGeoFetcher(cfg *Config) *geoFetcher {
 		cfg:      cfg,
 		inflight: map[string]bool{},
 		failed:   map[string]bool{},
-		client:   &http.Client{Timeout: geoHTTPTimeout},
+		client: &http.Client{
+			Timeout: geoDownloadTimeout,
+			Transport: &http.Transport{
+				DialContext: (&net.Dialer{Timeout: geoDialTimeout}).DialContext,
+				// соединение переиспользуем: наборов за сессию единицы
+				MaxIdleConnsPerHost: 2,
+			},
+		},
 	}
 }
 
@@ -67,6 +80,19 @@ func (f *geoFetcher) urlFor(kind, name string) string {
 	return strings.ReplaceAll(tpl, "{name}", name)
 }
 
+// isDatMode — источник задан без {name}, значит это единый .dat-файл.
+func (f *geoFetcher) isDatMode(kind string) bool {
+	tpl := f.cfg.GeositeURL
+	if kind == "geoip" {
+		tpl = f.cfg.GeoipURL
+	}
+	return strings.TrimSpace(tpl) != "" && !strings.Contains(tpl, "{name}")
+}
+
+func (f *geoFetcher) datPath(kind string) string {
+	return filepath.Join(f.cfg.GeoCacheDir, kind+".dat")
+}
+
 func (f *geoFetcher) cachePath(kind, name string) string {
 	return filepath.Join(f.cfg.GeoCacheDir, kind, name+".txt")
 }
@@ -79,6 +105,41 @@ func (f *geoFetcher) ensure(kind, name string) {
 	if f.urlFor(kind, name) == "" {
 		return
 	}
+	if f.isDatMode(kind) {
+		key := kind + ":*"
+		f.mu.Lock()
+		if f.failed[key] || f.inflight[key] {
+			f.mu.Unlock()
+			return
+		}
+		f.inflight[key] = true
+		f.mu.Unlock()
+		go func() {
+			defer func() {
+				f.mu.Lock()
+				delete(f.inflight, key)
+				f.mu.Unlock()
+			}()
+			// один .dat за раз: иначе два потока качают и переименовывают
+			// один и тот же файл
+			geoDatMu.Lock()
+			defer geoDatMu.Unlock()
+			if _, err := os.Stat(f.datPath(kind)); err != nil {
+				if err := f.downloadDat(kind); err != nil {
+					if permanentGeoError(err) {
+						f.mu.Lock()
+						f.failed[key] = true
+						f.mu.Unlock()
+					}
+					log.Printf("гео: %s.dat — загрузка не удалась: %v", kind, err)
+					return
+				}
+			}
+			f.extractWanted(kind, true)
+		}()
+		return
+	}
+
 	key := kind + ":" + name
 	f.mu.Lock()
 	if f.failed[key] || f.inflight[key] {
@@ -95,9 +156,11 @@ func (f *geoFetcher) ensure(kind, name string) {
 			f.mu.Unlock()
 		}()
 		if err := f.download(kind, name); err != nil {
-			f.mu.Lock()
-			f.failed[key] = true
-			f.mu.Unlock()
+			if permanentGeoError(err) {
+				f.mu.Lock()
+				f.failed[key] = true
+				f.mu.Unlock()
+			}
 			log.Printf("гео: %s:%s — загрузка не удалась: %v", kind, name, err)
 			return
 		}
@@ -123,7 +186,7 @@ func (f *geoFetcher) download(kind, name string) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("HTTP %d от %s", resp.StatusCode, u)
+		return &httpStatusError{code: resp.StatusCode, url: u}
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
 	if err != nil {
@@ -283,7 +346,18 @@ func (f *geoFetcher) buildIPSet(name string, seen map[string]bool, depth int) (*
 
 // refreshReferenced перекачивает все уже загруженные наборы (полночь).
 func (f *geoFetcher) refreshReferenced() {
+	for _, kind := range []string{"geosite", "geoip"} {
+		if f.isDatMode(kind) {
+			f.refreshDat(kind)
+		}
+	}
 	site, ip := f.cfg.loadedSets()
+	if f.isDatMode("geosite") {
+		site = nil
+	}
+	if f.isDatMode("geoip") {
+		ip = nil
+	}
 	for _, n := range site {
 		if err := f.download("geosite", n); err != nil {
 			log.Printf("гео: geosite:%s — обновление не удалось: %v", n, err)
@@ -372,6 +446,10 @@ func (c *Config) loadedSets() (site, ip []string) {
 	return
 }
 
+// geoDatMu сериализует скачивание+разбор единого .dat на весь процесс:
+// наборы общие для всех Config, параллельный разбор 70 МБ бессмыслен.
+var geoDatMu sync.Mutex
+
 // prefetchReferenced — наборы, на которые ссылаются правила, тянем фоном
 // (сам DNS-запрос сеть не ждёт).
 func (c *Config) prefetchReferenced() {
@@ -412,4 +490,179 @@ func (f *geoFetcher) rebuildLoaded() {
 			f.cfg.setGeoip(n, set)
 		}
 	}
+}
+
+// downloadDat качает единый .dat в кэш (атомарно).
+func (f *geoFetcher) downloadDat(kind string) error {
+	tpl := f.cfg.GeositeURL
+	if kind == "geoip" {
+		tpl = f.cfg.GeoipURL
+	}
+	if tpl == "" {
+		return fmt.Errorf("URL для %s не задан", kind)
+	}
+	resp, err := f.client.Get(tpl)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return &httpStatusError{code: resp.StatusCode, url: tpl}
+	}
+	dst := f.datPath(kind)
+	if _, err := os.Stat(dst); err == nil {
+		return nil // уже скачано другим потоком
+	}
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return err
+	}
+	tmp := dst + ".tmp"
+	out, err := os.Create(tmp)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, io.LimitReader(resp.Body, 512<<20)); err != nil {
+		out.Close()
+		return err
+	}
+	if err := out.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, dst); err != nil {
+		if _, statErr := os.Stat(dst); statErr == nil {
+			os.Remove(tmp)
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+// extractWanted разбирает .dat один раз и ставит все нужные категории.
+func (f *geoFetcher) extractWanted(kind string, onlyMissing bool) {
+	all := f.cfg.referencedSets(kind)
+	// разбираем только те, которых ещё нет: повторный вызов (второй поток,
+	// перечитывание) не должен заново парсить 70 МБ
+	want := map[string]bool{}
+	for n := range all {
+		if !onlyMissing {
+			want[n] = true
+			continue
+		}
+		if kind == "geosite" && f.cfg.peekGeosite(n) == nil {
+			want[n] = true
+		}
+		if kind == "geoip" && f.cfg.peekGeoip(n) == nil {
+			want[n] = true
+		}
+	}
+	if len(want) == 0 {
+		return
+	}
+	data, err := os.ReadFile(f.datPath(kind))
+	if err != nil {
+		log.Printf("гео: %s.dat — чтение кэша: %v", kind, err)
+		return
+	}
+	switch kind {
+	case "geosite":
+		sets, err := extractGeosite(data, want)
+		if err != nil {
+			log.Printf("гео: geosite.dat — разбор: %v", err)
+			return
+		}
+		for n, s := range sets {
+			s.Source = f.datPath(kind)
+			f.cfg.setGeosite(n, s)
+		}
+		log.Printf("гео: geosite.dat — применено категорий: %d из %d запрошенных", len(sets), len(want))
+	case "geoip":
+		sets, err := extractGeoip(data, want)
+		if err != nil {
+			log.Printf("гео: geoip.dat — разбор: %v", err)
+			return
+		}
+		for n, s := range sets {
+			s.Source = f.datPath(kind)
+			f.cfg.setGeoip(n, s)
+		}
+		log.Printf("гео: geoip.dat — применено категорий: %d из %d запрошенных", len(sets), len(want))
+	}
+}
+
+// referencedSets — имена наборов этого вида, упомянутые в правилах.
+func (c *Config) referencedSets(kind string) map[string]bool {
+	out := map[string]bool{}
+	c.geoMu.RLock()
+	defer c.geoMu.RUnlock()
+	if kind == "geosite" {
+		for _, r := range c.Routes {
+			for _, m := range r.Match {
+				if set, ok := strings.CutPrefix(strings.ToLower(strings.TrimSpace(m)), "geosite:"); ok {
+					out[set] = true
+				}
+			}
+		}
+		for n := range c.geosite {
+			out[n] = true
+		}
+		return out
+	}
+	for _, r := range c.AnswerGeoip {
+		out[strings.ToLower(strings.TrimSpace(r.Set))] = true
+	}
+	for n := range c.geoip {
+		out[n] = true
+	}
+	return out
+}
+
+// permanentGeoError — «нет такого набора» (404/403/410) запоминаем, а сетевые
+// таймауты — нет: следующий запрос попробует снова.
+func permanentGeoError(err error) bool {
+	var se *httpStatusError
+	if errors.As(err, &se) {
+		switch se.code {
+		case http.StatusNotFound, http.StatusForbidden, http.StatusGone:
+			return true
+		}
+	}
+	return false
+}
+
+type httpStatusError struct {
+	code int
+	url  string
+}
+
+func (e *httpStatusError) Error() string {
+	return fmt.Sprintf("HTTP %d от %s", e.code, e.url)
+}
+
+// peekGeosite / peekGeoip — чтение без ленивой загрузки (для внутренних
+// проверок: getGeosite на промахе запускает скачивание, здесь это лишнее).
+func (c *Config) peekGeosite(name string) *domainSet {
+	c.geoMu.RLock()
+	defer c.geoMu.RUnlock()
+	return c.geosite[name]
+}
+
+func (c *Config) peekGeoip(name string) *ipSet {
+	c.geoMu.RLock()
+	defer c.geoMu.RUnlock()
+	return c.geoip[name]
+}
+
+// refreshDat — полночное обновление единого .dat: файл перекачивается целиком,
+// затем нужные категории разбираются заново (наборы подменяются на месте).
+func (f *geoFetcher) refreshDat(kind string) {
+	geoDatMu.Lock()
+	defer geoDatMu.Unlock()
+	os.Remove(f.datPath(kind))
+	if err := f.downloadDat(kind); err != nil {
+		log.Printf("гео: %s.dat — обновление не удалось: %v", kind, err)
+		return
+	}
+	f.extractWanted(kind, false)
+	log.Printf("гео: %s.dat — обновлён", kind)
 }
