@@ -37,7 +37,7 @@ const warmPoolSize = 4
 
 type upstream struct {
 	name    string
-	kind    string // udp | dot | doh
+	kind    string // udp | dot | doh | block
 	addr    string // host:port либо URL
 	timeout time.Duration
 
@@ -56,6 +56,13 @@ type upstream struct {
 	inflight atomic.Int32 // сколько сокетов выдано в работу
 
 	device string // имя интерфейса из bind_devices ("" — не прибит)
+
+	// block — апстрим-заглушка: не ходит в сеть, сразу отвечает заданным
+	// кодом (blockRcode). Нужен, чтобы блокировать штатно (chain: [blocked]),
+	// а не мёртвым адресом вроде 127.0.0.1:1. Отдельный признак, потому что
+	// NOERROR — это код 0, его нельзя отличить от «не заглушка».
+	block      bool
+	blockRcode int
 
 	// hc — постоянный HTTP-клиент для DoH. Заведён один на апстрим, чтобы
 	// соединение жило между запросами: транспорт с пулом переиспользует
@@ -80,6 +87,15 @@ func newUpstream(name, spec string, timeout time.Duration, device string, b boot
 	spec = strings.TrimSpace(spec)
 	if timeout <= 0 {
 		timeout = 4 * time.Second
+	}
+	// Заглушки: не адрес, а готовый отказ.
+	switch strings.ToLower(spec) {
+	case "refuse", "refused":
+		return &upstream{name: name, kind: "block", block: true, blockRcode: dns.RcodeRefused, timeout: timeout}, nil
+	case "nxdomain", "nx":
+		return &upstream{name: name, kind: "block", block: true, blockRcode: dns.RcodeNameError, timeout: timeout}, nil
+	case "noerror", "empty":
+		return &upstream{name: name, kind: "block", block: true, blockRcode: dns.RcodeSuccess, timeout: timeout}, nil
 	}
 	u := &upstream{name: name, timeout: timeout, dialer: &net.Dialer{Timeout: timeout}}
 	if device != "" {
@@ -214,6 +230,8 @@ func (u *upstream) String() string {
 
 func (u *upstream) exchange(m *dns.Msg, network string) (*dns.Msg, error) {
 	switch u.kind {
+	case "block":
+		return blockReply(m, u.blockRcode), nil
 	case "doh":
 		return u.doh(m)
 	case "dot":
@@ -521,4 +539,13 @@ func (u *upstream) doh(m *dns.Msg) (*dns.Msg, error) {
 	}
 	out.Id = m.Id
 	return out, nil
+}
+
+// blockReply — синтетический ответ заглушки: тот же вопрос, заданный код.
+func blockReply(m *dns.Msg, rcode int) *dns.Msg {
+	r := new(dns.Msg)
+	r.SetReply(m)
+	r.RecursionAvailable = true
+	r.Rcode = rcode
+	return r
 }

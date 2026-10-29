@@ -14,6 +14,10 @@ per category.
 ```yaml
 geosite_dir: /etc/smartdns/geosite     # directory with <name>.txt files
 
+servers:
+  upstream: 8.8.8.8
+  blocked: refuse                       # stub: no network, answers REFUSED
+
 routes:
   - match: ["geosite:category-ads-all"]
     chain: [blocked]                    # first match wins

@@ -14,6 +14,10 @@
 ```yaml
 geosite_dir: /etc/smartdns/geosite     # каталог с файлами <name>.txt
 
+servers:
+  upstream: 8.8.8.8
+  blocked: refuse                       # заглушка: в сеть не ходит, сразу REFUSED
+
 routes:
   - match: ["geosite:category-ads-all"]
     chain: [blocked]                    # первое совпадение выигрывает

@@ -63,6 +63,9 @@ func (a *App) apply(cfg *Config) error {
 			if len(cfg.WarmServers) > 0 && !cfg.warmServers[name] {
 				continue
 			}
+			if u.block {
+				continue // заглушке греть нечего
+			}
 			u.enablePool()
 			uu := u
 			tick := a.tickFor(uu)
@@ -272,6 +275,12 @@ func (a *App) resolveQuery(r *dns.Msg, network string) *dns.Msg {
 				trace = append(trace, step{srv, "err", errText(err)})
 				continue
 			}
+			// заглушка — это решение, а не мусор: её код не отбраковываем
+			if u.block {
+				trace = append(trace, step{srv, "block", dns.RcodeToString[u.blockRcode]})
+				resp = m
+				break
+			}
 			if why := cfg.rejectReason(m, q.Qtype); why != "" {
 				trace = append(trace, step{srv, "bad", why})
 				lastBad = m
@@ -347,6 +356,8 @@ func traceString(s []step) string {
 			parts = append(parts, x.server+" OK")
 		case "bad":
 			parts = append(parts, x.server+"["+x.detail+"]")
+		case "block":
+			parts = append(parts, x.server+"→"+x.detail)
 		default:
 			parts = append(parts, x.server+"(ошибка)")
 		}
