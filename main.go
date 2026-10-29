@@ -169,11 +169,13 @@ func run(stop <-chan struct{}) error {
 	log.Printf("IPv6: %s", map[bool]string{true: "пропускаем", false: "вырезаем"}[cfg.IPv6])
 	log.Printf("кэш: %s", cacheStatus(cfg))
 	log.Printf("серверы:%s", cfg.String())
-	log.Printf("правил: %d, записей в hosts: %d", len(cfg.Routes), len(cfg.Hosts))
+	log.Printf("правил: %d, hosts: %d из конфига + %d из файлов%s",
+		len(cfg.Routes), cfg.hostsFromConfig(), cfg.hostsFromFiles(), cfg.hostsFilesBrief())
 
 	group.start(app, cfg)
 	watchSignals()
 	go purgeLoop()
+	go watchHostsFiles()
 
 	if stop == nil {
 		stop = quit
@@ -285,6 +287,21 @@ func describe(cfg *Config, path string) {
 		fmt.Println("\nhosts:")
 		for _, k := range sortedKeys(cfg.Hosts) {
 			fmt.Printf("  %-34s %s\n", k, cfg.Hosts[k])
+		}
+	}
+	if len(cfg.HostsFiles) > 0 {
+		fmt.Printf("\nhosts_files: %d из конфига, %d из файлов\n",
+			cfg.hostsFromConfig(), cfg.hostsFromFiles())
+		for _, st := range cfg.hostsFiles {
+			if st.Err != nil {
+				fmt.Printf("  %-46s ошибка: %v\n", st.Path, st.Err)
+				continue
+			}
+			fmt.Printf("  %-46s %d записей", st.Path, st.Entries)
+			if st.Shadowed > 0 {
+				fmt.Printf(", перекрыто %d", st.Shadowed)
+			}
+			fmt.Println()
 		}
 	}
 	fmt.Println("\nцепочки (первое совпадение выигрывает):")

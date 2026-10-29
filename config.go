@@ -162,7 +162,12 @@ type Config struct {
 	BootstrapDNS string            `yaml:"bootstrap_dns"`
 	Servers      map[string]string `yaml:"servers"`
 	Hosts        map[string]string `yaml:"hosts"`
-	Routes       []Route           `yaml:"routes"`
+	// HostsFiles — файлы (или каталоги с файлами) в формате /etc/hosts.
+	// Записи подмешиваются к hosts: явные записи из секции hosts главнее,
+	// внутри файлов первое вхождение выигрывает. Изменение файла на диске
+	// подхватывается само (опрос раз в 5 с), SIGHUP перечитывает всё сразу.
+	HostsFiles []string `yaml:"hosts_files"`
+	Routes     []Route  `yaml:"routes"`
 
 	// BindDevices — имя апстрима -> сетевой интерфейс (SO_BINDTODEVICE).
 	// Апстрим тогда выходит через указанный интерфейс независимо от
@@ -177,6 +182,9 @@ type Config struct {
 	rejectNets   []net.IPNet
 	rejectRcodes map[int]bool
 	boot         boot // бутстрап: резолвер + прибитые адреса
+
+	// что прочитано из hosts_files: для логов и -check
+	hostsFiles []hostsFileStat
 }
 
 // BootstrapSpec — значение ключа bootstrap: либо адрес резолвера, либо
@@ -245,7 +253,7 @@ func defaultConfig() Config {
 var knownTopKeys = []string{
 	"listen", "ipv6", "timeout", "log", "verbose", "reject", "cache",
 	"dot", "doh", "warm", "warm_name", "warm_servers", "prefetch",
-	"bootstrap", "bootstrap_dns", "servers", "hosts", "routes", "bind_devices",
+	"bootstrap", "bootstrap_dns", "servers", "hosts", "hosts_files", "routes", "bind_devices",
 }
 
 func warnUnknownKeys(data []byte) {
@@ -342,6 +350,11 @@ func LoadConfig(path string) (*Config, error) {
 	}
 
 	if err := cfg.prepare(); err != nil {
+		return nil, err
+	}
+	// Файлы hosts подмешиваются до validate: их записи должны пройти ту же
+	// проверку значения, что и явные.
+	if err := cfg.loadHostsFiles(); err != nil {
 		return nil, err
 	}
 	if err := cfg.validate(); err != nil {
