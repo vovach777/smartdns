@@ -31,6 +31,11 @@ import (
 	"time"
 )
 
+// defaultGeoCache — кэш гео-баз во временном каталоге ОС (/tmp/smartdns).
+// Наборы всё равно перекачиваются (ленивая загрузка + полночное обновление),
+// так что переживать перезагрузку /tmp им не обязательно.
+var defaultGeoCache = filepath.Join(os.TempDir(), "smartdns")
+
 const (
 	// источники по умолчанию — те, с которых наборы и брались
 	// По умолчанию — российские базы v2ray-формата (.dat, всегда последняя
@@ -38,7 +43,6 @@ const (
 	// берутся только упомянутые в правилах категории.
 	defaultGeositeURL = "https://raw.githubusercontent.com/runetfreedom/russia-v2ray-rules-dat/release/geosite.dat"
 	defaultGeoipURL   = "https://raw.githubusercontent.com/runetfreedom/russia-v2ray-rules-dat/release/geoip.dat"
-	defaultGeoCache   = "/var/cache/smartdns"
 
 	geoDialTimeout     = 15 * time.Second // установка соединения
 	geoDownloadTimeout = 10 * time.Minute // тело: .dat бывает 70 МБ

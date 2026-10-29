@@ -21,7 +21,8 @@ geoip_url:   https://raw.githubusercontent.com/runetfreedom/russia-v2ray-rules-d
 ```
 
 The file is downloaded whole (geosite.dat ≈ 70 MB, geoip.dat ≈ 18 MB) and cached
-as `<geo_cache_dir>/geosite.dat` / `geoip.dat`. Only the categories referenced by
+as `<geo_cache_dir>/geosite.dat` / `geoip.dat`; `geo_cache_dir` defaults to
+`/tmp/smartdns`, so after a reboot the databases are simply downloaded again. Only the categories referenced by
 rules are kept in memory: the file is parsed in a single pass and the other
 1000+ categories are dropped.
 
@@ -79,7 +80,7 @@ geoip_url:   https://www.ipdeny.com/ipblocks/data/aggregated/{name}-aggregated.z
 ## Diagnostics
 
 ```
-гео-наборы: лениво по URL, кэш /var/cache/smartdns
+гео-наборы: лениво по URL, кэш /tmp/smartdns
   домены: https://…/geosite.dat (единый .dat)
   адреса: https://…/geoip.dat (единый .dat)
   обновление: ежедневно в 00:00
