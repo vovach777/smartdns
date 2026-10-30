@@ -355,14 +355,14 @@ func (f *geoFetcher) buildDomainSet(name string, seen map[string]bool, depth int
 				set.SkippedUnsupported++
 				continue
 			case "full":
-				v := strings.ToLower(strings.TrimSuffix(stripAttrs(val), "."))
+				v := strings.ToLower(stripWildcard(strings.TrimSuffix(stripAttrs(val), ".")))
 				if v != "" && !set.Full[v] {
 					set.Full[v] = true
 					set.Entries++
 				}
 				continue
 			case "domain":
-				v := strings.ToLower(strings.TrimSuffix(stripAttrs(val), "."))
+				v := strings.ToLower(stripWildcard(strings.TrimSuffix(stripAttrs(val), ".")))
 				if v != "" {
 					suf[v] = struct{}{}
 					set.Entries++
@@ -370,7 +370,7 @@ func (f *geoFetcher) buildDomainSet(name string, seen map[string]bool, depth int
 				continue
 			}
 		}
-		v := strings.ToLower(strings.TrimSuffix(stripAttrs(line), "."))
+		v := strings.ToLower(stripWildcard(strings.TrimSuffix(stripAttrs(line), ".")))
 		if v != "" {
 			suf[v] = struct{}{}
 			set.Entries++
@@ -784,4 +784,11 @@ func (f *geoFetcher) backoff(key string) {
 	f.mu.Lock()
 	f.retryAt[key] = time.Now().Add(geoRetryPause)
 	f.mu.Unlock()
+}
+
+// stripWildcard убирает ведущее "*.": в наших наборах "домен и поддомены"
+// выражается самим именем, звёздочка только путала бы (суффикс "*.x" не
+// совпадёт никогда).
+func stripWildcard(v string) string {
+	return strings.TrimPrefix(strings.TrimSpace(v), "*.")
 }

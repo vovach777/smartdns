@@ -207,6 +207,38 @@ func TestPerNameDat(t *testing.T) {
 	}
 }
 
+// Текстовый список: голое имя — домен и поддомены, full: — только точное,
+// "*." снимается, regexp: в локальном каталоге честно ругается.
+func TestParseDomainSetWildcardAndFull(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "corp.txt")
+	body := "po.perco.ru\nfull:exact.perco.ru\n*.star.perco.ru\n"
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	set, err := parseDomainSet(path)
+	if err != nil {
+		t.Fatalf("разбор: %v", err)
+	}
+	for _, n := range []string{"po.perco.ru", "a.po.perco.ru", "exact.perco.ru", "star.perco.ru", "a.star.perco.ru"} {
+		if !set.match(n) {
+			t.Errorf("%s должен совпадать", n)
+		}
+	}
+	if set.match("x.exact.perco.ru") {
+		t.Error("full: не должен совпадать с поддоменом")
+	}
+	if set.match("xpo.perco.ru") {
+		t.Error("посторонний домен совпал")
+	}
+
+	if err := os.WriteFile(path, []byte("regexp:^ads[0-9]+\\.perco\\.ru$\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := parseDomainSet(path); err == nil {
+		t.Error("regexp: в локальном списке должен ругаться")
+	}
+}
+
 func TestCleanCache(t *testing.T) {
 	dir := t.TempDir()
 	cfg := &Config{GeositeURL: "https://x/{name}.dat", GeoCacheDir: dir}

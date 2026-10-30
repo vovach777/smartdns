@@ -123,7 +123,10 @@ func parseDomainSet(path string) (*domainSet, error) {
 			}
 		}
 		val = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(val), "."))
-		if val == "" {
+		// "*.example.com" в списках встречается: домен и поддомены у нас и
+		// так одно и то же, поэтому звёздочку просто снимаем
+		val = strings.TrimPrefix(val, "*.")
+		if val == "" || val == "*" {
 			return nil, fmt.Errorf("%s:%d: пустое имя", path, i+1)
 		}
 		if kind == "full" {

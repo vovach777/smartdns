@@ -36,6 +36,18 @@ Files:
 
 Set name = file name without `.txt`, so `geosite:cn` → `cn.txt`.
 
+### What a line means
+
+| line | meaning |
+|---|---|
+| `po.perco.ru` | the domain **and all subdomains** |
+| `domain:po.perco.ru` | the same |
+| `full:exact.perco.ru` | **exactly** this name, no subdomains |
+| `*.po.perco.ru` | the star is stripped — same as `po.perco.ru` |
+| `regexp:` / `keyword:` | unsupported: an error for files from a local directory, skipped and counted for lazily downloaded lists |
+
+There are no regexes or masks in lists — only "name and subdomains" or "exact name".
+
 ---
 
 ## List format
