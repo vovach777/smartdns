@@ -291,6 +291,12 @@ func describe(cfg *Config, path string) {
 	}
 	fmt.Printf("отбраковка:  сети %v, пустой A: %v, коды %v\n",
 		cfg.Reject.Networks, cfg.Reject.EmptyA, cfg.Reject.Rcodes)
+	for _, r := range cfg.Catches {
+		fmt.Printf("отлов:       %-14s %s -> %s\n", r.Name, r.what(), strings.Join(r.Chain, ", "))
+	}
+	for _, from := range sortedKeys(cfg.rewrites) {
+		fmt.Printf("патч имени:  %-30s -> %s\n", from, cfg.rewrites[from])
+	}
 	for _, d := range cfg.Dot {
 		fmt.Printf("DoT:         %s (сертификат %s)\n", d.Listen, d.Cert)
 		for _, n := range d.Named {
@@ -315,16 +321,29 @@ func describe(cfg *Config, path string) {
 		}
 	}
 	if cfg.fetch != nil {
-		fmt.Printf("\nгео-наборы: лениво по URL, кэш %s\n", cfg.GeoCacheDir)
-		srcMode := func(u string) string {
-			if u != "" && !strings.Contains(u, "{name}") {
-				return " (единый .dat)"
+		fmt.Printf("\nгео: кэш %s, обновление ежедневно в 00:00\n", cfg.GeoCacheDir)
+		for _, s := range cfg.geoSrcs {
+			kinds := make([]string, 0, 2)
+			if len(s.geosite) > 0 {
+				kinds = append(kinds, fmt.Sprintf("geosite %s", geoURLHint(s.geosite, s.datGeosite)))
 			}
-			return ""
+			if len(s.geoip) > 0 {
+				kinds = append(kinds, fmt.Sprintf("geoip %s", geoURLHint(s.geoip, s.datGeoip)))
+			}
+			fmt.Printf("  источник %-12s %s\n", s.name, strings.Join(kinds, "; "))
 		}
-		fmt.Printf("  домены: %s%s\n  адреса: %s%s\n",
-			cfg.GeositeURL, srcMode(cfg.GeositeURL), cfg.GeoipURL, srcMode(cfg.GeoipURL))
-		fmt.Printf("  обновление: ежедневно в 00:00\n")
+		spec := cfg.geoProxy
+		if spec.mode == proxyNone {
+			spec = cfg.proxy
+		}
+		switch spec.mode {
+		case proxyDirect:
+			fmt.Printf("  прокси:   direct (напрямую, перекрыт geo.proxy)\n")
+		case proxyEnv:
+			fmt.Printf("  прокси:   окружение (HTTP_PROXY/HTTPS_PROXY)\n")
+		case proxyURL:
+			fmt.Printf("  прокси:   %s://%s\n", spec.url.Scheme, spec.url.Host)
+		}
 	}
 	if len(cfg.geoip) > 0 {
 		fmt.Printf("\ngeoip: %d наборов из %s\n", len(cfg.geoip), cfg.GeoipDir)
@@ -377,6 +396,18 @@ func orDash(s string) string {
 		return "(в консоль)"
 	}
 	return s
+}
+
+// geoURLHint — краткое описание списка URL источника: режим и число зеркал.
+func geoURLHint(urls []string, dat bool) string {
+	mode := "{name}"
+	if dat {
+		mode = "единый .dat"
+	}
+	if len(urls) <= 1 {
+		return mode
+	}
+	return fmt.Sprintf("%s, зеркал: %d", mode, len(urls)-1)
 }
 
 func sortedKeys(m map[string]string) []string {

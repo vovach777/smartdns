@@ -148,24 +148,33 @@ func TestLooksBinary(t *testing.T) {
 // .dat в поштучном режиме ({name}.dat): файл из кэша разбирается как protobuf.
 func TestPerNameDat(t *testing.T) {
 	dir := t.TempDir()
-	cfg := &Config{GeositeURL: "https://x/{name}.dat", GeoipURL: "https://x/{name}.dat", GeoCacheDir: dir}
+	cfg := &Config{GeoCacheDir: dir}
+	cfg.Geo = Geo{Sources: []GeoSource{{
+		Name:    "x",
+		Geosite: []string{"https://x/{name}.dat"},
+		Geoip:   []string{"https://x/{name}.dat"},
+	}}}
+	if err := cfg.prepareGeo(); err != nil {
+		t.Fatal(err)
+	}
 	cfg.geosite = map[string]*domainSet{}
 	cfg.geoip = map[string]*ipSet{}
 	cfg.fetch = newGeoFetcher(cfg)
+	src := cfg.geoSrc("x")
 
 	type d = struct {
 		typ int
 		val string
 	}
 	site := geositeEntry("RU", d{2, "yandex.ru"}, d{3, "mail.yandex.ru"})
-	path := cfg.fetch.cachePath("geosite", "ru")
+	path := cfg.fetch.cachePath("geosite", src, "ru")
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(path, site, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	set, err := cfg.fetch.buildDomainSet("ru", map[string]bool{}, 0)
+	set, err := cfg.fetch.buildDomainSet(src, "ru", map[string]bool{}, 0)
 	if err != nil {
 		t.Fatalf("поштучный .dat: %v", err)
 	}
@@ -182,14 +191,14 @@ func TestPerNameDat(t *testing.T) {
 	var entry []byte
 	entry = append(entry, pbBytes(1, []byte("RU"))...)
 	entry = append(entry, cidr([]byte{5, 8, 0, 0}, 16)...)
-	ipPath := cfg.fetch.cachePath("geoip", "ru")
+	ipPath := cfg.fetch.cachePath("geoip", src, "ru")
 	if err := os.MkdirAll(filepath.Dir(ipPath), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(ipPath, pbBytes(1, entry), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	ipSet, err := cfg.fetch.buildIPSet("ru", map[string]bool{}, 0)
+	ipSet, err := cfg.fetch.buildIPSet(src, "ru", map[string]bool{}, 0)
 	if err != nil {
 		t.Fatalf("поштучный geoip .dat: %v", err)
 	}
@@ -198,11 +207,11 @@ func TestPerNameDat(t *testing.T) {
 	}
 
 	// файл есть, но категории в нём нет — внятная ошибка, а не пустой набор
-	other := cfg.fetch.cachePath("geosite", "de")
+	other := cfg.fetch.cachePath("geosite", src, "de")
 	if err := os.WriteFile(other, site, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := cfg.fetch.buildDomainSet("de", map[string]bool{}, 0); err == nil {
+	if _, err := cfg.fetch.buildDomainSet(src, "de", map[string]bool{}, 0); err == nil {
 		t.Error("ждали ошибку про отсутствующую категорию")
 	}
 }
@@ -241,7 +250,7 @@ func TestParseDomainSetWildcardAndFull(t *testing.T) {
 
 func TestCleanCache(t *testing.T) {
 	dir := t.TempDir()
-	cfg := &Config{GeositeURL: "https://x/{name}.dat", GeoCacheDir: dir}
+	cfg := &Config{GeoCacheDir: dir}
 	f := newGeoFetcher(cfg)
 
 	old := filepath.Join(dir, "geosite.dat.tmp")
@@ -270,12 +279,22 @@ func TestCleanCache(t *testing.T) {
 }
 
 func TestIsDatMode(t *testing.T) {
-	cfg := &Config{GeositeURL: "https://x/geosite.dat", GeoipURL: "https://x/{name}.zone"}
-	f := newGeoFetcher(cfg)
-	if !f.isDatMode("geosite") {
+	cfg := &Config{Geo: Geo{Sources: []GeoSource{{
+		Name:    "x",
+		Geosite: []string{"https://x/geosite.dat"},
+		Geoip:   []string{"https://x/{name}.zone"},
+	}}}}
+	if err := cfg.prepareGeo(); err != nil {
+		t.Fatal(err)
+	}
+	src := cfg.geoSrc("x")
+	if src == nil {
+		t.Fatal("источник не разобран")
+	}
+	if !src.datMode("geosite") {
 		t.Error("geosite без {name} — это .dat")
 	}
-	if f.isDatMode("geoip") {
+	if src.datMode("geoip") {
 		t.Error("geoip с {name} — поштучный режим")
 	}
 }

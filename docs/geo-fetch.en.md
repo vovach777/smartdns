@@ -7,45 +7,83 @@ downloads them when they are first needed and refreshes them once a day.
 
 ---
 
-## Sources: two modes
+## Sources: geo.sources
 
-The mode is chosen by whether the URL contains `{name}`.
-
-**1. Single `.dat` (default)** — v2ray format, Russian databases from
-[runetfreedom/russia-v2ray-rules-dat](https://github.com/runetfreedom/russia-v2ray-rules-dat);
-the `release` branch always carries the latest version.
+Sets are downloaded from **named sources** declared in the `geo:` section. The
+flat `geosite_url`/`geoip_url` keys are gone.
 
 ```yaml
-geosite_url: https://raw.githubusercontent.com/runetfreedom/russia-v2ray-rules-dat/release/geosite.dat
-geoip_url:   https://raw.githubusercontent.com/runetfreedom/russia-v2ray-rules-dat/release/geoip.dat
+geo:
+  cache_dir: /var/cache/smartdns
+  proxy: socks5://127.0.0.1:10808      # optional; see "Download proxy"
+  sources:
+    - name: hagezi                     # referenced as geosite@hagezi:pro
+      geosite:
+        - https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/{name}.txt
+        - https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@main/wildcard/{name}.txt
+    - name: rf                         # referenced as geosite@rf:… and set: rf@…
+      geosite:
+        - https://raw.githubusercontent.com/runetfreedom/russia-blocked-geosite/release/{name}.txt
+      geoip:
+        - https://raw.githubusercontent.com/runetfreedom/russia-blocked-geoip/release/text/{name}.txt
 ```
 
-The file is downloaded whole (geosite.dat ≈ 70 MB, geoip.dat ≈ 18 MB) and cached
-as `<geo_cache_dir>/geosite.dat` / `geoip.dat`; `geo_cache_dir` defaults to
-`/tmp/smartdns`, so after a reboot the databases are simply downloaded again. Only the categories referenced by
-rules are kept in memory: the file is parsed in a single pass and the other
-1000+ categories are dropped.
+**Set references.**
 
-Category names inside the database are uppercase (`CATEGORY-ADS-ALL`, `RU`);
-rule names are case-insensitive: both `geosite:category-ads-all` and `geosite:RU`
-work.
+| Reference | Set comes from |
+|---|---|
+| `geosite:pro` (route), `set: pro` | the **first** source declaring that kind |
+| `geosite@hagezi:pro`, `set: rf@ru-blocked` | exactly the named source |
 
-**2. Per-name (`{name}` in the URL)** — v2fly/ipdeny text lists, one file per
-set:
+Source order in `sources:` is the default-search order; name collisions are
+resolved by the namespace. Local directories `geosite_dir`/`geoip_dir` act as
+the `dir` pseudo-source for non-namespaced references when no URL source
+declares that kind.
+
+**The mode is chosen by whether the URL contains `{name}`.**
+
+1. **Single `.dat`** (URL without `{name}`) — the file is downloaded whole
+   (e.g. `geosite.dat` ≈ 70 MB), cached as
+   `<cache_dir>/<kind>/<source>.dat`; only the categories referenced by rules
+   are kept in memory. Set names are case-insensitive.
+2. **Per-name** (`{name}` in the URL) — text lists, one file per set. Cache:
+   `<cache_dir>/<kind>/<source>/<name>.txt`.
+
+The file format is detected from the content, not the extension.
+
+**Several URLs per kind = mirrors:** the first one is used; on a network error
+or HTTP failure the next one is tried. Mixing `{name}` templates with plain
+files in one list is not allowed (split into separate sources).
+
+**YAML gotcha:** URLs containing `{name}` inside a flow list (`[ … ]`) must be
+quoted, or written as a block list — curly braces break the parser.
+
+`-check` prints sources, modes and mirror counts; a reference to an unknown
+source is a config error, not a silent no-op rule.
+
+---
+
+## Download proxy
+
+Downloads go out directly and do not read system proxy settings. If the source
+is unreachable directly (GitHub is flaky from some networks), route downloads
+through a proxy with a single key:
 
 ```yaml
-geosite_url: https://raw.githubusercontent.com/v2fly/domain-list-community/master/data/{name}
-geoip_url:   https://www.ipdeny.com/ipblocks/data/aggregated/{name}-aggregated.zone
+proxy: socks5://127.0.0.1:10808      # SOCKS5
+proxy: socks5h://user:pass@host:1080 # SOCKS5 with credentials
+proxy: http://127.0.0.1:10801        # HTTP CONNECT; https:// works too
+proxy: env                           # = yes: HTTP_PROXY/HTTPS_PROXY from the environment
 ```
 
-`{name}` is the set name from the rule (`geosite:category-ads-all` →
-`category-ads-all`). Cache: `<geo_cache_dir>/geosite/<name>.txt` and
-`<geo_cache_dir>/geoip/<name>.txt`.
+Schemes: `http://`, `https://`, `socks5://`, `socks5h://` — equivalent here,
+the target hostname is always passed to the proxy instead of being resolved
+locally. Credentials go straight into the URL. A typo in the scheme
+(`sock5://`) is a config error, not a silent fallback: `-check` reports it.
 
-**The format is detected from the file content, not the extension:** control
-bytes in the first bytes mean protobuf (`.dat`), otherwise it is text. So
-`https://…/{name}.dat` (one category per file) works as well; the extension does
-not matter.
+The proxy applies to **geo downloads only**. DoT/DoH/UDP upstreams keep going
+out directly. If the proxy is down, the download fails with the usual retry,
+and cached sets keep working.
 
 ---
 

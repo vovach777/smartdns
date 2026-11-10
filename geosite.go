@@ -89,7 +89,7 @@ func (c *Config) loadGeosite() error {
 			return err
 		}
 		set.Name = strings.TrimSuffix(fn, ".txt")
-		c.geosite[set.Name] = set
+		c.geosite[geoKey(geoDirSrc, set.Name)] = set
 	}
 	return nil
 }
@@ -153,9 +153,19 @@ func parseDomainSet(path string) (*domainSet, error) {
 	return set, nil
 }
 
-// geositeMatch — true, если имя попало в набор `name` (аргумент "geosite:name").
+// geositeMatch — true, если имя попало в набор по ссылке "geosite:name"
+// (первый источник, объявивший geosite; в конце — локальный geosite_dir).
 func (c *Config) geositeMatch(set, host string) bool {
-	s := c.getGeosite(strings.ToLower(set))
+	s := c.resolveGeoSrc("geosite", "")
+	if s == nil {
+		return false
+	}
+	return c.geositeMatchIn(s.name, set, host)
+}
+
+// geositeMatchIn — то же для ссылки с неймспейсом "geosite@источник:имя".
+func (c *Config) geositeMatchIn(src, set, host string) bool {
+	s := c.getGeositeKey(strings.ToLower(src), strings.ToLower(set))
 	if s == nil {
 		return false
 	}

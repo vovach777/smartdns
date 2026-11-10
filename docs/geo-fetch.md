@@ -7,44 +7,90 @@
 
 ---
 
-## Источники: два режима
+## Источники: geo.sources
 
-Режим определяется тем, есть ли в URL `{name}`.
-
-**1. Единый `.dat` (по умолчанию)** — формат v2ray, российские базы
-[runetfreedom/russia-v2ray-rules-dat](https://github.com/runetfreedom/russia-v2ray-rules-dat):
-в ветке `release` всегда лежит последняя версия.
+Наборы качаются из **именованных источников** секции `geo:`. Плоские ключи
+`geosite_url`/`geoip_url` убраны.
 
 ```yaml
-geosite_url: https://raw.githubusercontent.com/runetfreedom/russia-v2ray-rules-dat/release/geosite.dat
-geoip_url:   https://raw.githubusercontent.com/runetfreedom/russia-v2ray-rules-dat/release/geoip.dat
+geo:
+  cache_dir: /var/cache/smartdns
+  proxy: socks5://127.0.0.1:10808      # по желанию; см. «Прокси для скачивания»
+  sources:
+    - name: hagezi                     # ссылки: geosite@hagezi:pro
+      geosite:
+        - https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/{name}.txt
+        - https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@main/wildcard/{name}.txt
+    - name: rf                         # ссылки: geosite@rf:… и set: rf@…
+      geosite:
+        - https://raw.githubusercontent.com/runetfreedom/russia-blocked-geosite/release/{name}.txt
+      geoip:
+        - https://raw.githubusercontent.com/runetfreedom/russia-blocked-geoip/release/text/{name}.txt
+    - name: ipdeny
+      geoip:
+        - https://www.ipdeny.com/ipblocks/data/aggregated/{name}-aggregated.zone
 ```
 
-Файл качается целиком (geosite.dat ≈ 70 МБ, geoip.dat ≈ 18 МБ), кэшируется как
-`<geo_cache_dir>/geosite.dat` / `geoip.dat`; по умолчанию `geo_cache_dir` —
-`/tmp/smartdns`, так что после перезагрузки базы просто скачаются заново. В памяти остаются **только**
-категории, упомянутые в правилах: файл разбирается одним проходом, остальные
-1000+ категорий выбрасываются.
+**Ссылки на наборы.**
 
-Имена категорий в базе — в верхнем регистре (`CATEGORY-ADS-ALL`, `RU`), в
-правилах регистр не важен: `geosite:category-ads-all` и `geosite:RU` работают.
+| Ссылка | Откуда набор |
+|---|---|
+| `geosite:pro` (маршрут), `set: pro` | **первый** источник, объявивший этот вид |
+| `geosite@hagezi:pro`, `set: rf@ru-blocked` | ровно из названного источника |
 
-**2. По имени (`{name}` в URL)** — текстовые списки v2fly/ipdeny, по файлу на
-набор:
+`geosite@источник:имя` — для маршрутов; в полях `set:` (answer_geoip, catches)
+короче: `источник@имя`. Порядок источников в `sources:` — порядок поиска «по
+умолчанию»; пересечения имён разрешаются неймспейсом. Локальные каталоги
+`geosite_dir`/`geoip_dir` работают как псевдо-источник `dir` и отвечают на
+ссылки без неймспейса, если URL-источников с таким видом нет.
+
+**Режим определяется тем, есть ли в URL `{name}`.**
+
+1. **Единый `.dat`** (URL без `{name}`) — файл качается целиком (например,
+   [runetfreedom/russia-v2ray-rules-dat](https://github.com/runetfreedom/russia-v2ray-rules-dat),
+   `geosite.dat` ≈ 70 МБ, `geoip.dat` ≈ 18 МБ), кэшируется как
+   `<cache_dir>/<вид>/<источник>.dat`; в память попадают **только** категории,
+   упомянутые в правилах. Регистр имён не важен: `CATEGORY-ADS-ALL` = `category-ads-all`.
+2. **По имени** (`{name}` в URL) — текстовые списки, по файлу на набор.
+   Кэш: `<cache_dir>/<вид>/<источник>/<имя>.txt`.
+
+Формат файла выбирается по содержимому, а не по расширению; `.dat`-файл на
+одну категорию тоже работает.
+
+**Несколько URL в одном виде = зеркала:** качаем по первому, при сетевом сбое
+или HTTP-ошибке — следующее. Смешивать `{name}` и файлы без `{name}` в одном
+списке нельзя (раздели на разные источники).
+
+**Внимание к YAML:** URL с `{name}` внутри flow-списка (`[ … ]`) надо брать
+в кавычки или писать block-списком через `-`: фигурные скобки рвут разбор.
+
+**Проверка:** `-check` печатает источники, режимы и число зеркал; ссылка на
+несуществующий источник — ошибка конфигурации, а не молчаливое «правило не
+срабатывает».
+
+---
+
+## Прокси для скачивания
+
+Скачивание идёт напрямую из резолвера и системных настроек прокси не читает.
+Если источник недоступен напрямую (GitHub из некоторых сетей доступен «через
+раз»), скачивание уводится через прокси одним ключом:
 
 ```yaml
-geosite_url: https://raw.githubusercontent.com/v2fly/domain-list-community/master/data/{name}
-geoip_url:   https://www.ipdeny.com/ipblocks/data/aggregated/{name}-aggregated.zone
+proxy: socks5://127.0.0.1:10808      # SOCKS5
+proxy: socks5h://user:pass@host:1080 # SOCKS5 с учётными данными
+proxy: http://127.0.0.1:10801        # HTTP CONNECT; https:// тоже можно
+proxy: env                           # = yes: HTTP_PROXY/HTTPS_PROXY из окружения
 ```
 
-`{name}` — имя набора из правила (`geosite:category-ads-all` →
-`category-ads-all`). Кэш: `<geo_cache_dir>/geosite/<name>.txt` и
-`<geo_cache_dir>/geoip/<name>.txt`.
+Схемы: `http://`, `https://`, `socks5://`, `socks5h://` — в нашей реализации
+равнозначны, имя цели всегда уходит прокси, локально не резолвится. Учётные
+данные — прямо в URL. Опечатка в схеме (`sock5://`, без второй «s») — ошибка
+конфигурации, а не молчаливое «напрямую»: `-check` её покажет.
 
-**Формат выбирается по содержимому файла, а не по расширению:** если в первых
-байтах есть управляющие символы — это protobuf (`.dat`), иначе текст. Поэтому
-`https://…/{name}.dat` (одна категория на файл) тоже работает; расширение роли
-не играет.
+Прокси касается **только скачивания** гео-списков. Апстримы DoT/DoH/UDP ходят
+напрямую, как и ходили. Если прокси недоступен — загрузка падает с обычным
+retry, а наборы из кэша продолжают работать.
 
 ---
 
@@ -87,19 +133,19 @@ geoip_url:   https://www.ipdeny.com/ipblocks/data/aggregated/{name}-aggregated.z
 ## Диагностика
 
 ```
-гео-наборы: лениво по URL, кэш /tmp/smartdns
-  домены: https://…/geosite.dat (единый .dat)
-  адреса: https://…/geoip.dat (единый .dat)
-  обновление: ежедневно в 00:00
+гео: кэш /var/cache/smartdns, обновление ежедневно в 00:00
+  источник rf       geosite {name}; geoip {name}
+  источник hagezi   geosite {name}, зеркал: 1
+  прокси:   socks5://127.0.0.1:10808
 ```
 
 В логе:
 
 ```
-гео: geosite.dat — применено категорий: 1 из 1 запрошенных
-гео: geoip — загрузка не удалась: HTTP 404 …
+гео: geosite@hagezi:pro загружен по URL и применён
+гео: geosite@rf:youtube — загрузка не удалась: HTTP 404 …
 гео: полночь — обновляю загруженные наборы
-гео: geosite.dat — обновлён
+гео: geoip@rf.dat — обновлён
 ```
 
 Если правило «не срабатывает» сразу после старта — это ожидаемо: набор ещё

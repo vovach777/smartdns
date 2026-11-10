@@ -72,7 +72,7 @@ func TestParseIPSetRejectsGarbage(t *testing.T) {
 
 func TestApplyAnswerGeoip(t *testing.T) {
 	s := writeSet(t, "140.82.0.0/16\n")
-	cfg := &Config{geoip: map[string]*ipSet{"blocked": s}}
+	cfg := &Config{GeoipDir: "/sets", geoip: map[string]*ipSet{geoKey(geoDirSrc, "blocked"): s}}
 
 	mk := func(ip string) *dns.Msg {
 		m := new(dns.Msg)
@@ -116,9 +116,9 @@ func TestApplyAnswerGeoip(t *testing.T) {
 
 func TestBuildDomainSetIncludeAndAttrs(t *testing.T) {
 	dir := t.TempDir()
-	os.MkdirAll(filepath.Join(dir, "geosite"), 0o755)
+	os.MkdirAll(filepath.Join(dir, "geosite", "t"), 0o755)
 	write := func(name, body string) {
-		if err := os.WriteFile(filepath.Join(dir, "geosite", name+".txt"), []byte(body), 0o644); err != nil {
+		if err := os.WriteFile(filepath.Join(dir, "geosite", "t", name+".txt"), []byte(body), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -126,8 +126,12 @@ func TestBuildDomainSetIncludeAndAttrs(t *testing.T) {
 	write("child", "domain:child.example @cn\nfull:exact.example\nregexp:^re\\.\n")
 
 	cfg := &Config{GeoCacheDir: dir, geosite: map[string]*domainSet{}, geoip: map[string]*ipSet{}}
+	cfg.Geo = Geo{Sources: []GeoSource{{Name: "t", Geosite: []string{"https://t/{name}"}}}}
+	if err := cfg.prepareGeo(); err != nil {
+		t.Fatal(err)
+	}
 	f := newGeoFetcher(cfg)
-	set, err := f.buildDomainSet("root", map[string]bool{}, 0)
+	set, err := f.buildDomainSet(cfg.geoSrc("t"), "root", map[string]bool{}, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

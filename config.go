@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/url"
 	"os"
 	"sort"
 	"strconv"
@@ -178,14 +179,26 @@ type Config struct {
 	// AnswerGeoip — фильтр ГОТОВОГО ответа по адресным наборам: не меняет
 	// маршрут и не делает повторных запросов, только переписывает ответ.
 	AnswerGeoip []AnswerRule `yaml:"answer_geoip"`
-	// GeositeURL / GeoipURL — шаблоны URL для ленивой загрузки наборов,
-	// {name} заменяется именем набора. Пустое значение = взять по умолчанию
-	// (v2fly для доменов, ipdeny для адресов).
-	GeositeURL string `yaml:"geosite_url"`
-	GeoipURL   string `yaml:"geoip_url"`
 	// GeoCacheDir — куда складывать скачанные наборы.
-	GeoCacheDir string  `yaml:"geo_cache_dir"`
-	Routes      []Route `yaml:"routes"`
+	GeoCacheDir string `yaml:"geo_cache_dir"`
+	// Proxy — прокси для скачивания гео-списков: URL (http://, https://,
+	// socks5://, socks5h://) или "env"/"yes" — переменные окружения
+	// HTTP(S)_PROXY. Касается только скачивания, не апстримов. Пусто —
+	// качать напрямую.
+	Proxy string `yaml:"proxy"`
+	// Geo — структурированная секция гео-списков: именованные источники
+	// с URL-шаблонами, прокси и кэш. Плоские geosite_url/geoip_url убраны.
+	Geo    Geo     `yaml:"geo"`
+	Routes []Route `yaml:"routes"`
+	// Catches — отлов по адресу в готовом ответе: если адрес попал под
+	// правило, запрос переспрашивается другой цепочкой. Это НЕ routes:
+	// маршрут выбирается по имени до запроса, а адрес появляется после.
+	Catches []CatchRule `yaml:"catches"`
+	// Rewrite — простой патч имени: запрос за одним именем разрешается как
+	// другое имя. Одна подмена, без CNAME и без второго запроса клиента;
+	// ответ возвращается под исходным именем. Значение — домен, не IP
+	// (для IP есть hosts).
+	Rewrite map[string]string `yaml:"rewrite"`
 
 	// BindDevices — имя апстрима -> сетевой интерфейс (SO_BINDTODEVICE).
 	// Апстрим тогда выходит через указанный интерфейс независимо от
@@ -199,7 +212,12 @@ type Config struct {
 	warmServers  map[string]bool
 	rejectNets   []net.IPNet
 	rejectRcodes map[int]bool
-	boot         boot // бутстрап: резолвер + прибитые адреса
+	rewrites map[string]string // нормализованные пары rewrite
+	proxy    proxySpec         // верхний proxy: (для скачивания гео)
+	geoProxy proxySpec         // geo.proxy — перекрывает верхний
+
+	geoSrcs []*geoSourceResolved // geo.sources по порядку объявления
+	boot         boot              // бутстрап: резолвер + прибитые адреса
 
 	// что прочитано из hosts_files: для логов и -check
 	hostsFiles []hostsFileStat
@@ -274,6 +292,325 @@ func defaultConfig() Config {
 	}
 }
 
+// GeoSource — один именованный источник гео-списков. URL с {name} —
+// поштучный текстовый режим ({name} заменяется именем набора); URL без
+// {name} — единый .dat источника (из него берутся упомянутые категории).
+// Несколько URL в списке — зеркала: качаем по первому, при сбое следующее.
+type GeoSource struct {
+	Name    string   `yaml:"name"`
+	Geosite []string `yaml:"geosite"`
+	Geoip   []string `yaml:"geoip"`
+}
+
+// Geo — секция geo: кэш, прокси и источники.
+type Geo struct {
+	CacheDir string      `yaml:"cache_dir"`
+	Proxy    string      `yaml:"proxy"`
+	Sources  []GeoSource `yaml:"sources"`
+}
+
+// geoSourceResolved — разобранный источник: нормализованные URL и режимы.
+type geoSourceResolved struct {
+	name       string
+	geosite    []string
+	geoip      []string
+	datGeosite bool // geosite-URL без {name} — единый .dat
+	datGeoip   bool
+}
+
+// datMode — единый .dat или поштучные файлы для этого вида.
+func (s *geoSourceResolved) datMode(kind string) bool {
+	if kind == "geoip" {
+		return s.datGeoip
+	}
+	return s.datGeosite
+}
+
+// proxySpec — разобранное значение proxy: (direct | env | yes | URL).
+type proxySpec struct {
+	mode int
+	url  *url.URL
+}
+
+const (
+	proxyNone = iota
+	proxyDirect
+	proxyEnv
+	proxyURL
+)
+
+// parseProxySpec — разбираем значение proxy. "direct" — напрямую (полезно
+// в geo.proxy перекрыть глобальный), "env"/"yes" — окружение, иначе URL
+// с понятной схемой. Всё остальное — ошибка, а не молчаливое "напрямую":
+// опечатка вида sock5:// должна падать в -check, а не тихо качать напрямую.
+func parseProxySpec(v string) (proxySpec, error) {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return proxySpec{}, nil
+	}
+	switch strings.ToLower(v) {
+	case "direct":
+		return proxySpec{mode: proxyDirect}, nil
+	case "env", "yes", "true":
+		return proxySpec{mode: proxyEnv}, nil
+	}
+	u, err := url.Parse(v)
+	if err != nil {
+		return proxySpec{}, fmt.Errorf("proxy %q: %w", v, err)
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "http", "https", "socks5", "socks5h":
+	case "":
+		return proxySpec{}, fmt.Errorf("proxy %q: нет схемы — жду http://, https://, socks5:// или socks5h://", v)
+	default:
+		return proxySpec{}, fmt.Errorf("proxy %q: схема %q не поддерживается — жду http://, https://, socks5:// или socks5h://", v, u.Scheme)
+	}
+	if u.Host == "" {
+		return proxySpec{}, fmt.Errorf("proxy %q: нет адреса хоста", v)
+	}
+	return proxySpec{mode: proxyURL, url: u}, nil
+}
+
+// geoKey — ключ набора в картах c.geosite/c.geoip: "источник/имя".
+func geoKey(src, name string) string { return src + "/" + name }
+
+// splitGeoKindRef — хвост ссылки в маршруте: "hagezi:pro" → (hagezi, pro).
+func splitGeoKindRef(s string) (string, string, error) {
+	src, name, ok := strings.Cut(s, ":")
+	if !ok || strings.TrimSpace(src) == "" || strings.TrimSpace(name) == "" ||
+		strings.ContainsAny(src, "@") || strings.Contains(name, "@") {
+		return "", "", fmt.Errorf("жду источник:имя (например hagezi:pro)")
+	}
+	return strings.ToLower(strings.TrimSpace(src)), strings.ToLower(strings.TrimSpace(name)), nil
+}
+
+// parseGeoSetRef — ссылка на набор в поле set: (answer_geoip, catches).
+// "rf@ru-blocked" — из источника rf; "ru-blocked" — первый источник,
+// объявивший geoip.
+func parseGeoSetRef(v string) (src, name string, err error) {
+	v = strings.ToLower(strings.TrimSpace(v))
+	if v == "" {
+		return "", "", fmt.Errorf("пустая ссылка на набор")
+	}
+	if i := strings.IndexByte(v, '@'); i >= 0 {
+		src, name = v[:i], v[i+1:]
+		if src == "" || name == "" || strings.ContainsAny(name, "@:") {
+			return "", "", fmt.Errorf("ссылка %q: жду источник@имя", v)
+		}
+		return src, name, nil
+	}
+	if strings.ContainsAny(v, "@:") {
+		return "", "", fmt.Errorf("ссылка %q: @ и : тут не нужны", v)
+	}
+	return "", v, nil
+}
+
+// geoSrc — источник по имени.
+func (c *Config) geoSrc(name string) *geoSourceResolved {
+	name = strings.ToLower(strings.TrimSpace(name))
+	for _, s := range c.geoSrcs {
+		if s.name == name {
+			return s
+		}
+	}
+	return nil
+}
+
+// firstGeoSrc — первый источник, объявивший наборы такого вида.
+func (c *Config) firstGeoSrc(kind string) *geoSourceResolved {
+	for _, s := range c.geoSrcs {
+		if (kind == "geosite" && len(s.geosite) > 0) || (kind == "geoip" && len(s.geoip) > 0) {
+			return s
+		}
+	}
+	return nil
+}
+
+// resolveGeoSrc — кто отвечает за ссылку: URL-источники по порядку, в конце —
+// локальные каталоги geosite_dir/geoip_dir как псевдо-источник "dir".
+func (c *Config) resolveGeoSrc(kind, src string) *geoSourceResolved {
+	if src != "" {
+		return c.geoSrc(src)
+	}
+	if s := c.firstGeoSrc(kind); s != nil {
+		return s
+	}
+	if (kind == "geosite" && strings.TrimSpace(c.GeositeDir) != "") ||
+		(kind == "geoip" && strings.TrimSpace(c.GeoipDir) != "") {
+		return &geoSourceResolved{name: "dir"}
+	}
+	return nil
+}
+
+func (c *Config) geoSrcList() string {
+	names := make([]string, 0, len(c.geoSrcs))
+	for _, s := range c.geoSrcs {
+		names = append(names, s.name)
+	}
+	return strings.Join(names, ", ")
+}
+
+// prepareGeo — разбираем секцию geo: источники, кэш, прокси — и проверяем,
+// что каждая ссылка из правил попадает в существующий источник.
+func (c *Config) prepareGeo() error {
+	c.geoSrcs = nil
+	seen := map[string]bool{}
+	for i, s := range c.Geo.Sources {
+		name := strings.ToLower(strings.TrimSpace(s.Name))
+		if name == "" {
+			return fmt.Errorf("geo.sources[%d]: у источника нужно имя (name:)", i)
+		}
+		if seen[name] {
+			return fmt.Errorf("geo.sources: источник %q объявлен дважды", name)
+		}
+		seen[name] = true
+		src := &geoSourceResolved{name: name}
+		var err error
+		if src.geosite, src.datGeosite, err = normalizeGeoURLs(name, "geosite", s.Geosite); err != nil {
+			return err
+		}
+		if src.geoip, src.datGeoip, err = normalizeGeoURLs(name, "geoip", s.Geoip); err != nil {
+			return err
+		}
+		if len(src.geosite) == 0 && len(src.geoip) == 0 {
+			return fmt.Errorf("geo.sources[%d] %q: не задан ни один URL (geosite:/geoip:)", i, name)
+		}
+		c.geoSrcs = append(c.geoSrcs, src)
+	}
+
+	// кэш: geo.cache_dir перекрывает geo_cache_dir; разные значения — ошибка
+	if cd := strings.TrimSpace(c.Geo.CacheDir); cd != "" {
+		if strings.TrimSpace(c.GeoCacheDir) != "" && c.GeoCacheDir != cd {
+			return fmt.Errorf("заданы и geo.cache_dir (%s), и geo_cache_dir (%s) — оставь один", cd, c.GeoCacheDir)
+		}
+		c.GeoCacheDir = cd
+	}
+
+	spec, err := parseProxySpec(c.Geo.Proxy)
+	if err != nil {
+		return fmt.Errorf("geo.proxy: %w", err)
+	}
+	c.geoProxy = spec
+
+	return c.validateGeoRefs()
+}
+
+// normalizeGeoURLs — проверяем схему и единообразие режима: в одном списке
+// нельзя смешивать {name}-шаблоны и единый .dat.
+func normalizeGeoURLs(src, kind string, urls []string) ([]string, bool, error) {
+	out := make([]string, 0, len(urls))
+	withName := 0
+	for _, u := range urls {
+		u = strings.TrimSpace(u)
+		if u == "" {
+			continue
+		}
+		pu, err := url.Parse(u)
+		if err != nil {
+			return nil, false, fmt.Errorf("geo.sources[%s] %s: %q: %w", src, kind, u, err)
+		}
+		scheme := strings.ToLower(pu.Scheme)
+		if scheme != "http" && scheme != "https" {
+			return nil, false, fmt.Errorf("geo.sources[%s] %s: %q: схема %q — жду http:// или https://", src, kind, u, scheme)
+		}
+		if pu.Host == "" {
+			return nil, false, fmt.Errorf("geo.sources[%s] %s: %q: нет хоста", src, kind, u)
+		}
+		if strings.Contains(u, "{name}") {
+			withName++
+		}
+		out = append(out, u)
+	}
+	if len(out) == 0 {
+		return nil, false, nil
+	}
+	dat := withName == 0
+	if !dat && withName != len(out) {
+		return nil, false, fmt.Errorf("geo.sources[%s] %s: смешаны шаблоны с {name} и без — раздели на разные источники", src, kind)
+	}
+	return out, dat, nil
+}
+
+// validateGeoRefs — ссылка на набор должна попадать в существующий источник,
+// объявивший нужный вид. Иначе правило молчит (тот класс багов, что мы ловили
+// с referencedSets) — лучше упасть в -check.
+func (c *Config) validateGeoRefs() error {
+	checkGeosite := func(src, name string) error {
+		if src == "" {
+			if c.firstGeoSrc("geosite") == nil && strings.TrimSpace(c.GeositeDir) == "" {
+				return fmt.Errorf("geosite:%s — в geo.sources нет ни одного источника с geosite (плоские geosite_url/geoip_url убраны — перенеси источники в geo: sources)", name)
+			}
+			return nil
+		}
+		s := c.geoSrc(src)
+		if s == nil {
+			return fmt.Errorf("geosite@%s:%s — нет источника %q (есть: %s)", src, name, src, c.geoSrcList())
+		}
+		if len(s.geosite) == 0 {
+			return fmt.Errorf("geosite@%s:%s — источник %q не объявляет geosite", src, name, src)
+		}
+		return nil
+	}
+	checkGeoip := func(src, name string) error {
+		if src == "" {
+			if c.firstGeoSrc("geoip") == nil && strings.TrimSpace(c.GeoipDir) == "" {
+				return fmt.Errorf("set: %s — в geo.sources нет ни одного источника с geoip", name)
+			}
+			return nil
+		}
+		s := c.geoSrc(src)
+		if s == nil {
+			return fmt.Errorf("set: %s@%s — нет источника %q (есть: %s)", name, src, src, c.geoSrcList())
+		}
+		if len(s.geoip) == 0 {
+			return fmt.Errorf("set: %s@%s — источник %q не объявляет geoip", name, src, src)
+		}
+		return nil
+	}
+	for _, r := range c.Routes {
+		for _, m := range r.Match {
+			m = strings.ToLower(strings.TrimSpace(m))
+			if strings.HasPrefix(m, "geosite@") {
+				src, nm, err := splitGeoKindRef(strings.TrimPrefix(m, "geosite@"))
+				if err != nil {
+					return fmt.Errorf("маршрут %q: %w", m, err)
+				}
+				if err := checkGeosite(src, nm); err != nil {
+					return err
+				}
+				continue
+			}
+			if set, ok := strings.CutPrefix(m, "geosite:"); ok {
+				if err := checkGeosite("", set); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	for _, r := range c.AnswerGeoip {
+		src, nm, err := parseGeoSetRef(r.Set)
+		if err != nil {
+			return fmt.Errorf("answer_geoip: %w", err)
+		}
+		if err := checkGeoip(src, nm); err != nil {
+			return err
+		}
+	}
+	for _, r := range c.Catches {
+		if strings.TrimSpace(r.Set) == "" {
+			continue
+		}
+		src, nm, err := parseGeoSetRef(r.Set)
+		if err != nil {
+			return fmt.Errorf("catches %q: %w", r.Name, err)
+		}
+		if err := checkGeoip(src, nm); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // knownTopKeys — ключи верхнего уровня, которые конфиг понимает.
 //
 // YAML разбирается нестрого (yaml.Unmarshal, без KnownFields), поэтому
@@ -285,7 +622,7 @@ func defaultConfig() Config {
 var knownTopKeys = []string{
 	"listen", "ipv6", "timeout", "log", "verbose", "reject", "cache",
 	"dot", "doh", "warm", "warm_name", "warm_servers", "prefetch",
-	"bootstrap", "bootstrap_dns", "servers", "hosts", "hosts_files", "geosite_dir", "geoip_dir", "answer_geoip", "geosite_url", "geoip_url", "geo_cache_dir", "routes", "bind_devices",
+	"bootstrap", "bootstrap_dns", "servers", "hosts", "hosts_files", "geosite_dir", "geoip_dir", "answer_geoip", "geo", "geo_cache_dir", "proxy", "routes", "catches", "rewrite", "bind_devices",
 }
 
 func warnUnknownKeys(data []byte) {
@@ -310,6 +647,34 @@ func warnUnknownKeys(data []byte) {
 	}
 }
 
+// rejectRemovedGeoKeys — плоские geosite_url/geoip_url убраны в пользу
+// geo.sources. Ловим их прямо в YAML и объясняем миграцию: без этого конфиг
+// выглядел бы рабочим, а наборы перестали бы качаться.
+func rejectRemovedGeoKeys(data []byte) error {
+	var node yaml.Node
+	if err := yaml.Unmarshal(data, &node); err != nil || len(node.Content) == 0 {
+		return nil
+	}
+	root := node.Content[0]
+	if root.Kind != yaml.MappingNode {
+		return nil
+	}
+	for i := 0; i+1 < len(root.Content); i += 2 {
+		k := strings.ToLower(strings.TrimSpace(root.Content[i].Value))
+		if k == "geosite_url" || k == "geoip_url" {
+			return fmt.Errorf("ключ %s убран — перенеси источники в секцию geo:\n"+
+				"  geo:\n"+
+				"    cache_dir: /var/cache/smartdns\n"+
+				"    proxy: socks5://127.0.0.1:10808   # по желанию\n"+
+				"    sources:\n"+
+				"      - name: rf\n"+
+				"        geosite: [ https://raw.githubusercontent.com/runetfreedom/russia-blocked-geosite/release/{name}.txt ]\n"+
+				"        geoip:   [ https://raw.githubusercontent.com/runetfreedom/russia-blocked-geoip/release/text/{name}.txt ]", k)
+		}
+	}
+	return nil
+}
+
 // LoadConfig читает YAML поверх значений по умолчанию: чего в файле нет,
 // то остаётся дефолтным.
 func LoadConfig(path string) (*Config, error) {
@@ -322,6 +687,9 @@ func LoadConfig(path string) (*Config, error) {
 		}
 		if err := yaml.Unmarshal(data, &cfg); err != nil {
 			return nil, fmt.Errorf("разбор %s: %w", path, err)
+		}
+		if err := rejectRemovedGeoKeys(data); err != nil {
+			return nil, err
 		}
 		warnUnknownKeys(data)
 	}
@@ -395,12 +763,6 @@ func LoadConfig(path string) (*Config, error) {
 	if err := cfg.loadGeoip(); err != nil {
 		return nil, err
 	}
-	if cfg.GeositeURL == "" {
-		cfg.GeositeURL = defaultGeositeURL
-	}
-	if cfg.GeoipURL == "" {
-		cfg.GeoipURL = defaultGeoipURL
-	}
 	if cfg.GeoCacheDir == "" {
 		cfg.GeoCacheDir = defaultGeoCache
 	}
@@ -437,7 +799,66 @@ func (c *Config) prepare() error {
 		}
 		c.rejectRcodes[n] = true
 	}
+	if err := c.prepareProxy(); err != nil {
+		return err
+	}
+	if err := c.prepareGeo(); err != nil {
+		return err
+	}
+	if err := c.prepareCatches(); err != nil {
+		return err
+	}
+	return c.prepareRewrites()
+}
+
+// prepareProxy — разбираем верхний proxy: (global для скачивания гео;
+// geo.proxy перекрывает). Разбор значения — в parseProxySpec.
+func (c *Config) prepareProxy() error {
+	spec, err := parseProxySpec(c.Proxy)
+	if err != nil {
+		return err
+	}
+	c.proxy = spec
 	return nil
+}
+
+// prepareRewrites нормализует пары «имя -> имя»: нижний регистр, без точки
+// на конце. Значение обязано быть доменом: IP — это hosts, а не патч имени.
+func (c *Config) prepareRewrites() error {
+	c.rewrites = map[string]string{}
+	for from, to := range c.Rewrite {
+		f := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(from), "."))
+		t := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(to), "."))
+		if f == "" || t == "" {
+			return fmt.Errorf("rewrite: пустое имя в паре %q: %q", from, to)
+		}
+		if strings.ContainsAny(f+t, "*") {
+			return fmt.Errorf("rewrite: %s -> %s: шаблоны не поддерживаются, только точные имена", f, t)
+		}
+		if net.ParseIP(t) != nil {
+			return fmt.Errorf("rewrite: %s -> %s: для IP используйте hosts", f, t)
+		}
+		if _, ok := dns.IsDomainName(dns.Fqdn(f)); !ok {
+			return fmt.Errorf("rewrite: %q — не доменное имя", from)
+		}
+		if _, ok := dns.IsDomainName(dns.Fqdn(t)); !ok {
+			return fmt.Errorf("rewrite: %q — не доменное имя", to)
+		}
+		if f == t {
+			return fmt.Errorf("rewrite: %s -> %s: имя ссылается на себя", f, t)
+		}
+		c.rewrites[f] = t
+	}
+	return nil
+}
+
+// rewriteFor — на какое имя подменить запрос ("" — не подменять).
+func (c *Config) rewriteFor(name string) (string, bool) {
+	if len(c.rewrites) == 0 {
+		return "", false
+	}
+	to, ok := c.rewrites[name]
+	return to, ok
 }
 
 func (c *Config) validate() error {
@@ -476,6 +897,9 @@ func (c *Config) validate() error {
 				return fmt.Errorf("в chain указан неизвестный сервер %q; известные: %v", s, names)
 			}
 		}
+	}
+	if err := c.validateCatches(known, names); err != nil {
+		return err
 	}
 	for s, dev := range c.BindDevices {
 		if !known[s] {
@@ -657,6 +1081,16 @@ func (c *Config) routeFor(name string) []string {
 	for _, r := range c.Routes {
 		for _, m := range r.Match {
 			m = strings.ToLower(strings.TrimSpace(m))
+			if strings.HasPrefix(m, "geosite@") {
+				src, set, err := splitGeoKindRef(strings.TrimPrefix(m, "geosite@"))
+				if err != nil {
+					continue // невалидную ссылку отсеял prepareGeo
+				}
+				if c.geositeMatchIn(src, set, name) {
+					return r.Chain
+				}
+				continue
+			}
 			if set, ok := strings.CutPrefix(m, "geosite:"); ok {
 				if c.geositeMatch(set, name) {
 					return r.Chain

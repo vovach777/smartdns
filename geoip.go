@@ -9,6 +9,10 @@ package main
 // переписать его (nxdomain / refused / пустой noerror). Отфильтрованный ответ
 // кладётся в кэш как есть, повторной фильтрации и повторного запроса нет.
 //
+// Осознанное исключение — catch.go: там переспрос по адресу всё-таки есть,
+// но с защитой от петли (каждое правило срабатывает не больше раза за запрос)
+// и с явным приоритетом: catch раньше reject, а не наоборот.
+//
 // Набор — текстовый файл, по строке на префикс:
 //
 //	1.0.1.0/24
@@ -154,7 +158,7 @@ func (c *Config) loadGeoip() error {
 			return err
 		}
 		set.Name = strings.TrimSuffix(fn, ".txt")
-		c.geoip[set.Name] = set
+		c.geoip[geoKey(geoDirSrc, set.Name)] = set
 	}
 	return nil
 }
@@ -172,7 +176,7 @@ func (c *Config) applyAnswerGeoip(m *dns.Msg) bool {
 		}
 	}
 	for _, rule := range c.AnswerGeoip {
-		set := c.getGeoip(strings.ToLower(strings.TrimSpace(rule.Set)))
+		set := c.geoipSetRef(rule.Set)
 		if set == nil {
 			continue
 		}

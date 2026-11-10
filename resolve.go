@@ -223,7 +223,9 @@ func (a *App) resolveQuery(r *dns.Msg, network string) *dns.Msg {
 		cfg, ups, cache := a.snapshot()
 
 		q := r.Question[0]
-		name := strings.ToLower(strings.TrimSuffix(q.Name, "."))
+		origFqdn := q.Name
+		origName := strings.ToLower(strings.TrimSuffix(q.Name, "."))
+		name := origName
 		key := name + "|" + strconv.Itoa(int(q.Qtype))
 
 		// 1. Статические подмены из секции hosts.
@@ -233,6 +235,21 @@ func (a *App) resolveQuery(r *dns.Msg, network string) *dns.Msg {
 				log.Printf("ХОСТ    %-5s %-34s -> %s", dns.TypeToString[q.Qtype], name, v)
 			}
 			return m
+		}
+
+		// 1b. Патч имени: спрашиваем апстрим уже за целевое имя, ответ
+		// возвращаем под исходным. Одна подмена, без CNAME и без второго
+		// запроса клиента. Маршрут выбирается по целевому имени.
+		rq := r
+		patched := false
+		if to, ok := cfg.rewriteFor(name); ok {
+			patched = true
+			name = to
+			rq = r.Copy()
+			rq.Question[0].Name = dns.Fqdn(to)
+			if cfg.Verbose {
+				log.Printf("ПАТЧ    %-5s %-34s -> %s", dns.TypeToString[q.Qtype], origName, name)
+			}
 		}
 
 		// 2. IPv6 вырезан: на AAAA отвечаем пустым NOERROR, без записей.
@@ -259,44 +276,10 @@ func (a *App) resolveQuery(r *dns.Msg, network string) *dns.Msg {
 		}
 
 		// 4. Цепочка: первый сервер, чей ответ не отбракован, и есть ответ.
-		chain := cfg.routeFor(name)
-		var (
-			resp    *dns.Msg
-			lastBad *dns.Msg
-			trace   []step
-		)
-		for _, srv := range chain {
-			u := ups[srv]
-			if u == nil {
-				continue
-			}
-			m, err := u.exchange(r, network)
-			if err != nil || m == nil {
-				trace = append(trace, step{srv, "err", errText(err)})
-				continue
-			}
-			// заглушка — это решение, а не мусор: её код не отбраковываем
-			if u.block {
-				trace = append(trace, step{srv, "block", dns.RcodeToString[u.blockRcode]})
-				resp = m
-				break
-			}
-			if why := cfg.rejectReason(m, q.Qtype); why != "" {
-				trace = append(trace, step{srv, "bad", why})
-				lastBad = m
-				continue
-			}
-			trace = append(trace, step{srv, "ok", ""})
-			resp = m
-			break
-		}
-
-		usedBad := false
-		if resp == nil && lastBad != nil {
-			// Вся цепочка погадила — отдаём последний ответ как есть,
-			// иначе клиент получит SERVFAIL и тоже никуда не пойдёт.
-			resp, usedBad = lastBad, true
-		}
+		// Внутри — отлов по адресу: правило может переспросить ответ
+		// другой цепочкой (см. exchangeChain).
+		res := a.exchangeChain(rq, network, cfg.routeFor(name), cfg, ups, q.Qtype, name, map[string]bool{})
+		resp, usedBad, trace := res.resp, res.usedBad, res.trace
 
 		if resp == nil {
 			m := new(dns.Msg)
@@ -304,7 +287,7 @@ func (a *App) resolveQuery(r *dns.Msg, network string) *dns.Msg {
 			m.RecursionAvailable = true
 			m.Rcode = dns.RcodeServerFailure
 			log.Printf("СБОЙ    %-5s %-34s никто из цепочки не ответил: %s",
-				dns.TypeToString[q.Qtype], name, traceString(trace))
+				dns.TypeToString[q.Qtype], origName, traceString(trace))
 			return m
 		}
 
@@ -317,6 +300,9 @@ func (a *App) resolveQuery(r *dns.Msg, network string) *dns.Msg {
 			log.Printf("ГЕО     %-5s %-34s -> отфильтровано по answer_geoip",
 				dns.TypeToString[q.Qtype], name)
 		}
+		if patched {
+			restoreName(resp, dns.Fqdn(name), origFqdn)
+		}
 		if cfg.Cache.Enabled && cache != nil && !usedBad {
 			cache.Put(key, resp)
 		}
@@ -326,16 +312,108 @@ func (a *App) resolveQuery(r *dns.Msg, network string) *dns.Msg {
 			ip := answerIP(resp, q.Qtype)
 			verdict := "OK"
 			switch {
+			case res.caught:
+				verdict = "ПОЙМАН"
 			case usedBad:
 				verdict = "ПОГАНЫЙ"
 			case len(trace) > 1:
 				verdict = "ФОЛБЭК"
 			}
 			log.Printf("%-8s %-5s %-34s %-18s %s",
-				verdict, dns.TypeToString[q.Qtype], name, ip, traceString(trace))
+				verdict, dns.TypeToString[q.Qtype], origName, ip, traceString(trace))
 		}
 		return resp
 	}
+}
+
+// chainResult — итог одного прохода по цепочке.
+type chainResult struct {
+	resp    *dns.Msg
+	usedBad bool // отдали последний отбракованный: кэшировать нельзя
+	caught  bool // сработало catch-правило, ответ пришёл из переспроса
+	trace   []step
+}
+
+// exchangeChain проходит цепочку по порядку: первый сервер, чей ответ не
+// отбракован, и есть ответ. Заглушка — это решение, а не мусор.
+//
+// Отлов проверяется раньше отбраковки: правило знает, чем именно плох
+// адрес и куда за ним идти. Переспрос идёт своей цепочкой через тот же
+// метод, а used (правила, уже сработавшие в этом запросе) не даёт
+// зациклиться: каждое правило выгорает ровно один раз.
+//
+// Если переспрос не дал годного ответа, поведение откатывается к
+// обычному — как будто правила не было.
+func (a *App) exchangeChain(r *dns.Msg, network string, chain []string, cfg *Config, ups map[string]*upstream, qtype uint16, name string, used map[string]bool) chainResult {
+	if used == nil {
+		used = map[string]bool{}
+	}
+	var out chainResult
+	var lastBad *dns.Msg
+	var lastBadSrv string
+
+	for _, srv := range chain {
+		u := ups[srv]
+		if u == nil {
+			continue
+		}
+		m, err := u.exchange(r, network)
+		if err != nil || m == nil {
+			out.trace = append(out.trace, step{srv, "err", errText(err)})
+			continue
+		}
+		// заглушка — это решение, а не мусор: её код не отбраковываем
+		if u.block {
+			out.trace = append(out.trace, step{srv, "block", dns.RcodeToString[u.blockRcode]})
+			out.resp = m
+			return out
+		}
+		if rule, ip := cfg.catchMatch(m, used); rule != nil {
+			used[rule.Name] = true
+			out.trace = append(out.trace, step{srv, "catch", rule.Name})
+			sub := a.exchangeChain(r, network, rule.Chain, cfg, ups, qtype, name, used)
+			out.trace = append(out.trace, sub.trace...)
+			if sub.resp != nil && !sub.usedBad {
+				log.Printf("ОТЛОВ   %-5s %-34s %-18s %s -> %s OK",
+					dns.TypeToString[qtype], name, ip.String(), rule.Name, strings.Join(rule.Chain, ","))
+				out.resp, out.caught = sub.resp, true
+				return out
+			}
+			log.Printf("ОТЛОВ   %-5s %-34s %-18s %s -> %s не помог, продолжаю исходную цепочку",
+				dns.TypeToString[qtype], name, ip.String(), rule.Name, strings.Join(rule.Chain, ","))
+			// идём дальше как будто правила нет
+		}
+		if why := cfg.rejectReason(m, qtype); why != "" {
+			out.trace = append(out.trace, step{srv, "bad", why})
+			lastBad, lastBadSrv = m, srv
+			continue
+		}
+		out.trace = append(out.trace, step{srv, "ok", ""})
+		out.resp = m
+		return out
+	}
+
+	if out.resp == nil && lastBad != nil {
+		// Вся цепочка погадила. Прежде чем отдавать мусор, даём шанс
+		// правилам отлова — ровно для этого случая они и заведены.
+		if rule, ip := cfg.catchMatch(lastBad, used); rule != nil {
+			used[rule.Name] = true
+			out.trace = append(out.trace, step{lastBadSrv, "catch", rule.Name})
+			sub := a.exchangeChain(r, network, rule.Chain, cfg, ups, qtype, name, used)
+			out.trace = append(out.trace, sub.trace...)
+			if sub.resp != nil && !sub.usedBad {
+				log.Printf("ОТЛОВ   %-5s %-34s %-18s %s -> %s OK",
+					dns.TypeToString[qtype], name, ip.String(), rule.Name, strings.Join(rule.Chain, ","))
+				out.resp, out.caught = sub.resp, true
+				return out
+			}
+			log.Printf("ОТЛОВ   %-5s %-34s %-18s %s -> %s не помог, отдаю как есть",
+				dns.TypeToString[qtype], name, ip.String(), rule.Name, strings.Join(rule.Chain, ","))
+		}
+		// иначе клиент получит SERVFAIL и тоже никуда не пойдёт.
+		out.resp, out.usedBad = lastBad, true
+	}
+	return out
 }
 
 func errText(err error) string {
@@ -358,11 +436,32 @@ func traceString(s []step) string {
 			parts = append(parts, x.server+"["+x.detail+"]")
 		case "block":
 			parts = append(parts, x.server+"→"+x.detail)
+		case "catch":
+			parts = append(parts, x.server+"→отлов:"+x.detail)
 		default:
 			parts = append(parts, x.server+"(ошибка)")
 		}
 	}
 	return strings.Join(parts, " -> ")
+}
+
+// restoreName возвращает ответу исходное имя: и вопрос, и владельцев тех
+// записей, которые апстрим отдал под целевым именем. Глубже по CNAME-цепочке
+// не лезем: там уже чужие имена, и трогать их нельзя.
+func restoreName(m *dns.Msg, from, to string) {
+	if m == nil {
+		return
+	}
+	if len(m.Question) > 0 && strings.EqualFold(m.Question[0].Name, from) {
+		m.Question[0].Name = to
+	}
+	for _, sect := range [][]dns.RR{m.Answer, m.Ns, m.Extra} {
+		for _, rr := range sect {
+			if strings.EqualFold(rr.Header().Name, from) {
+				rr.Header().Name = to
+			}
+		}
+	}
 }
 
 func answerIP(m *dns.Msg, qtype uint16) string {
